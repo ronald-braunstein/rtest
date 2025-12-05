@@ -23,6 +23,18 @@ pub struct Args {
     #[arg(long)]
     pub collect_only: bool,
 
+    /// Output file for paths without parametrized tests (relative paths, one per line)
+    #[arg(long)]
+    pub split_simple_files: Option<String>,
+
+    /// Output file for paths with parametrized tests (relative paths, one per line)
+    #[arg(long)]
+    pub split_param_files: Option<String>,
+
+    /// Output file for rtest --collect-only output of parametrized files only
+    #[arg(long)]
+    pub split_param_tests: Option<String>,
+
     /// Test files or directories to run
     #[arg(help = "Test files or directories to run")]
     pub files: Vec<String>,

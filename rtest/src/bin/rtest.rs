@@ -2,10 +2,12 @@
 
 use clap::Parser;
 use rtest::{
-    cli::Args, collect_tests_rust, determine_worker_count, display_collection_results,
-    execute_tests, execute_tests_parallel, subproject, PytestRunner,
+    cli::Args, collect_tests_rust, collect_tests_rust_with_split, determine_worker_count,
+    display_collection_results, execute_tests, execute_tests_parallel, subproject, PytestRunner,
 };
 use std::env;
+use std::fs::File;
+use std::io::Write;
 
 pub fn main() {
     let args = Args::parse();
@@ -33,11 +35,65 @@ pub fn main() {
             std::process::exit(1);
         }
     };
-    let (test_nodes, errors) = match collect_tests_rust(rootpath.clone(), &args.files) {
-        Ok((nodes, errors)) => (nodes, errors),
-        Err(e) => {
-            eprintln!("FATAL: {e}");
-            std::process::exit(1);
+    // Check if we need to do split collection (any of the split flags are set)
+    let needs_split = args.split_simple_files.is_some()
+        || args.split_param_files.is_some()
+        || args.split_param_tests.is_some();
+
+    let (test_nodes, errors) = if needs_split {
+        let results = match collect_tests_rust_with_split(rootpath.clone(), &args.files) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("FATAL: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        // Write the split files
+        if let Some(ref path) = args.split_simple_files {
+            if let Err(e) = write_lines_to_file(path, &results.simple_files) {
+                eprintln!("Failed to write simple files to {}: {}", path, e);
+                std::process::exit(1);
+            }
+            eprintln!(
+                "Wrote {} simple files to {}",
+                results.simple_files.len(),
+                path
+            );
+        }
+
+        if let Some(ref path) = args.split_param_files {
+            if let Err(e) = write_lines_to_file(path, &results.param_files) {
+                eprintln!("Failed to write param files to {}: {}", path, e);
+                std::process::exit(1);
+            }
+            eprintln!(
+                "Wrote {} param files to {}",
+                results.param_files.len(),
+                path
+            );
+        }
+
+        if let Some(ref path) = args.split_param_tests {
+            if let Err(e) = write_lines_to_file(path, &results.param_file_tests) {
+                eprintln!("Failed to write param tests to {}: {}", path, e);
+                std::process::exit(1);
+            }
+            eprintln!(
+                "Wrote {} param tests to {}",
+                results.param_file_tests.len(),
+                path
+            );
+        }
+
+        (results.test_nodes, results.errors)
+    } else {
+        match collect_tests_rust(rootpath.clone(), &args.files) {
+            Ok((nodes, errors)) => (nodes, errors),
+            Err(e) => {
+                eprintln!("FATAL: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
@@ -103,4 +159,13 @@ pub fn main() {
         );
         std::process::exit(exit_code);
     }
+}
+
+/// Write lines to a file
+fn write_lines_to_file(path: &str, lines: &[String]) -> std::io::Result<()> {
+    let mut file = File::create(path)?;
+    for line in lines {
+        writeln!(file, "{}", line)?;
+    }
+    Ok(())
 }
