@@ -293,16 +293,10 @@ impl SemanticTestDiscovery {
                     ),
                 )?;
 
-                match resolved {
-                    Some(resolved) => base_classes.push(resolved),
-                    None => {
-                        return Err(CollectionError::ImportError(format!(
-                            "Could not resolve base class '{}' for class '{}'",
-                            self.format_base_class_expr(base),
-                            class_def.name
-                        )));
-                    }
+                if let Some(resolved) = resolved {
+                    base_classes.push(resolved);
                 }
+                // Skip unresolvable base classes - they won't contribute inherited methods
             }
         }
 
@@ -351,38 +345,30 @@ impl SemanticTestDiscovery {
                 let resolved =
                     self.resolve_base_class(base_expr, current_module_path, imports, semantic)?;
 
-                match resolved {
-                    Some(resolved) => {
-                        // Skip inheritance analysis for known stdlib modules that we can't analyze
-                        if self.is_stdlib_module_to_skip(&resolved.module_path) {
-                            // Skip inheritance collection for stdlib modules like unittest.TestCase
-                            // The class will still be collected with its own methods
-                            continue;
-                        }
-
-                        // Get methods from the base class
-                        if let Some(base_methods) =
-                            self.get_base_class_methods(&resolved, module_resolver)?
-                        {
-                            for method in base_methods {
-                                // Create a copy with the current class name
-                                all_tests.push(TestInfo {
-                                    name: method.name.clone(),
-                                    line: method.line,
-                                    is_method: true,
-                                    class_name: Some(class_name.to_string()),
-                                });
-                            }
-                        }
+                if let Some(resolved) = resolved {
+                    // Skip inheritance analysis for known stdlib modules that we can't analyze
+                    if self.is_stdlib_module_to_skip(&resolved.module_path) {
+                        // Skip inheritance collection for stdlib modules like unittest.TestCase
+                        // The class will still be collected with its own methods
+                        continue;
                     }
-                    None => {
-                        return Err(CollectionError::ImportError(format!(
-                            "Could not resolve base class '{}' for inheritance in class '{}'",
-                            self.format_base_class_expr(base_expr),
-                            class_name
-                        )));
+
+                    // Get methods from the base class
+                    if let Some(base_methods) =
+                        self.get_base_class_methods(&resolved, module_resolver)?
+                    {
+                        for method in base_methods {
+                            // Create a copy with the current class name
+                            all_tests.push(TestInfo {
+                                name: method.name.clone(),
+                                line: method.line,
+                                is_method: true,
+                                class_name: Some(class_name.to_string()),
+                            });
+                        }
                     }
                 }
+                // Skip unresolvable base classes - they won't contribute inherited methods
             }
         }
 
@@ -446,26 +432,18 @@ impl SemanticTestDiscovery {
                     ),
                 )?;
 
-                match resolved {
-                    Some(resolved) => {
-                        // Skip init check for known stdlib modules
-                        if self.is_stdlib_module_to_skip(&resolved.module_path) {
-                            // Assume stdlib modules like unittest.TestCase don't prevent collection
-                            continue;
-                        }
-
-                        if self.base_class_has_init(&resolved, module_resolver)? {
-                            return Ok(true);
-                        }
+                if let Some(resolved) = resolved {
+                    // Skip init check for known stdlib modules
+                    if self.is_stdlib_module_to_skip(&resolved.module_path) {
+                        // Assume stdlib modules like unittest.TestCase don't prevent collection
+                        continue;
                     }
-                    None => {
-                        return Err(CollectionError::ImportError(format!(
-                            "Could not resolve base class '{}' for __init__ check in class '{}'",
-                            self.format_base_class_expr(base_expr),
-                            class_def.name
-                        )));
+
+                    if self.base_class_has_init(&resolved, module_resolver)? {
+                        return Ok(true);
                     }
                 }
+                // Skip unresolvable base classes - assume they don't have __init__
             }
         }
 
@@ -543,11 +521,9 @@ impl SemanticTestDiscovery {
         // Check for cycles
         let key = (resolved.module_path.clone(), resolved.class_name.clone());
         if visited.contains(&key) {
-            // Cycle detected - this is an error condition
-            return Err(CollectionError::ParseError(format!(
-                "Circular inheritance detected in class hierarchy involving '{}'",
-                resolved.class_name
-            )));
+            // Cycle detected - return empty to break the cycle
+            // This can happen with complex mixin patterns
+            return Ok(None);
         }
         visited.insert(key.clone());
 
@@ -595,7 +571,23 @@ impl SemanticTestDiscovery {
 
         // Load the module and collect test classes
         {
-            let parsed_module = module_resolver.resolve_and_load(module_path)?;
+            let parsed_module = match module_resolver.resolve_and_load(module_path) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    // Module couldn't be resolved (e.g., built-in module, third-party module)
+                    // Mark as visited and return - we can't analyze this module but that's ok
+                    self.class_cache.insert(
+                        cache_key,
+                        TestClassInfo {
+                            name: String::new(),
+                            has_init: false,
+                            test_methods: vec![],
+                            base_classes: vec![],
+                        },
+                    );
+                    return Ok(());
+                }
+            };
 
             // Extract test class information without storing the module
             for stmt in &parsed_module.module.body {
@@ -699,6 +691,16 @@ impl SemanticTestDiscovery {
                     }
                 }
                 Ok(None)
+            }
+            Expr::Subscript(subscript_expr) => {
+                // Handle generic subscript like TestMixin[BaseTestWithPropertyTax]
+                // Extract the base type (before []) and resolve that
+                self.resolve_base_class(
+                    &subscript_expr.value,
+                    current_module_path,
+                    imports,
+                    _semantic,
+                )
             }
             _ => Ok(None),
         }
