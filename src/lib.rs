@@ -3,10 +3,12 @@
 use clap::Parser;
 use pyo3::prelude::*;
 use rtest::{
-    cli::Args, collect_tests_rust, determine_worker_count, display_collection_results,
-    execute_tests, execute_tests_parallel,
+    cli::Args, collect_tests_rust, collect_tests_rust_with_split, determine_worker_count,
+    display_collection_results, execute_tests, execute_tests_parallel,
 };
 use std::env;
+use std::fs::File;
+use std::io::Write;
 
 pub struct PytestRunner {
     pub program: String,
@@ -159,11 +161,84 @@ fn main_cli_with_args(py: Python, argv: Vec<String>) {
             std::process::exit(1);
         }
     };
-    let (test_nodes, errors) = match collect_tests_rust(rootpath.clone(), &args.files) {
-        Ok((nodes, errors)) => (nodes, errors),
-        Err(e) => {
-            eprintln!("FATAL: {e}");
-            std::process::exit(1);
+
+    // Check if split mode is enabled
+    let split_mode = args.split_simple_files.is_some() || args.split_param_files.is_some();
+
+    let (test_nodes, errors) = if split_mode {
+        // Use split collection - only output tests from simple files
+        match collect_tests_rust_with_split(rootpath.clone(), &args.files) {
+            Ok(results) => {
+                // Write simple files to output
+                if let Some(ref simple_path) = args.split_simple_files {
+                    if let Err(e) = write_file_list(simple_path, &results.simple_files) {
+                        eprintln!("Failed to write simple files: {e}");
+                        std::process::exit(1);
+                    }
+                    println!(
+                        "Wrote {} simple files to {}",
+                        results.simple_files.len(),
+                        simple_path
+                    );
+                }
+
+                // Write param files to output
+                if let Some(ref param_path) = args.split_param_files {
+                    if let Err(e) = write_file_list(param_path, &results.param_files) {
+                        eprintln!("Failed to write param files: {e}");
+                        std::process::exit(1);
+                    }
+                    println!(
+                        "Wrote {} param files to {}",
+                        results.param_files.len(),
+                        param_path
+                    );
+                }
+
+                // Write param file tests to output
+                if let Some(ref param_tests_path) = args.split_param_tests {
+                    if let Err(e) = write_file_list(param_tests_path, &results.param_file_tests) {
+                        eprintln!("Failed to write param tests: {e}");
+                        std::process::exit(1);
+                    }
+                    println!(
+                        "Wrote {} param file tests to {}",
+                        results.param_file_tests.len(),
+                        param_tests_path
+                    );
+                }
+
+                // In split mode, only return tests from simple files
+                // Filter test_nodes to only include tests from simple files
+                let simple_file_set: std::collections::HashSet<_> =
+                    results.simple_files.iter().collect();
+                let simple_tests: Vec<String> = results
+                    .test_nodes
+                    .into_iter()
+                    .filter(|node| {
+                        if let Some(file_path) = node.split("::").next() {
+                            simple_file_set.contains(&file_path.to_string())
+                        } else {
+                            false
+                        }
+                    })
+                    .collect();
+
+                (simple_tests, results.errors)
+            }
+            Err(e) => {
+                eprintln!("FATAL: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Regular collection
+        match collect_tests_rust(rootpath.clone(), &args.files) {
+            Ok((nodes, errors)) => (nodes, errors),
+            Err(e) => {
+                eprintln!("FATAL: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
@@ -206,6 +281,15 @@ fn main_cli_with_args(py: Python, argv: Vec<String>) {
         )
     };
     std::process::exit(exit_code);
+}
+
+/// Write a list of strings to a file, one per line
+fn write_file_list(path: &str, items: &[String]) -> std::io::Result<()> {
+    let mut file = File::create(path)?;
+    for item in items {
+        writeln!(file, "{}", item)?;
+    }
+    Ok(())
 }
 
 #[pymodule]
