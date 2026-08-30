@@ -2348,6 +2348,62 @@ class TestCollectionIntegration(unittest.TestCase):
             self.assertIn("rtest-cannot-expand: test_unresolved.py::test_unknown", result.output)
             self.assertIn("collected 1 item", result.output)
 
+    def test_parametrize_helper_call_is_unexpanded(self) -> None:
+        """Helper calls that return str/int must not become argnameN (pytest uses str(result))."""
+        files = {
+            "test_helper.py": textwrap.dedent("""
+                import pytest
+
+                def index_name():
+                    return "LIBOR_1M"
+
+                @pytest.mark.parametrize("libor_index, sofr_index", [(index_name(), index_name())])
+                def test_idx(libor_index, sofr_index):
+                    pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            result = run_collection(project_path)
+
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            assert_tests_found(result.output_lines, ["test_helper.py::test_idx"])
+            self.assertNotIn("libor_index0", result.output)
+            self.assertIn("Cannot statically expand", result.output)
+            self.assertIn("rtest-cannot-expand: test_helper.py::test_idx", result.output)
+
+    def test_parametrize_float_and_empty_string_match_pytest(self) -> None:
+        """Python str(0.0) is 0.0; empty string IDs are empty, not first_name0."""
+        files = {
+            "test_ids.py": textwrap.dedent("""
+                import pytest
+
+                @pytest.mark.parametrize("rate", [0.0, 1.0])
+                def test_rate(rate):
+                    pass
+
+                @pytest.mark.parametrize("first_name", ["", "bob"])
+                def test_name(first_name):
+                    pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            result = run_collection(project_path)
+
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            assert_tests_found(
+                result.output_lines,
+                [
+                    "test_ids.py::test_rate[0.0]",
+                    "test_ids.py::test_rate[1.0]",
+                    "test_ids.py::test_name[]",
+                    "test_ids.py::test_name[bob]",
+                ],
+            )
+            self.assertFalse(any(line.strip().endswith("::test_rate[0]") for line in result.output_lines))
+            self.assertNotIn("first_name0", result.output)
+
     def test_mark_parametrize_and_pytest_param_ids(self) -> None:
         """`@mark.parametrize` is recognized; pytest.param(id=) is used for case IDs."""
         files = {

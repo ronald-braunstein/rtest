@@ -522,13 +522,13 @@ fn extract_pytest_case(
             let mut parts = Vec::with_capacity(components.len());
             for (i, component) in components.iter().enumerate() {
                 let (value, id) = extract_literal(component, resolver, enclosing_class, id_style)?;
-                values.push(value);
-                if id.is_empty() {
+                if needs_positional_id(&value, &id) {
                     let name = argnames.get(i).map(String::as_str).unwrap_or("arg");
                     parts.push(format!("{}{}", name, idx));
                 } else {
                     parts.push(id);
                 }
+                values.push(value);
             }
             return Ok((LiteralValue::Sequence(values), parts.join("-")));
         }
@@ -548,12 +548,20 @@ fn sequence_elts(expr: &Expr) -> Option<&[Expr]> {
 
 fn finalize_pytest_id(id: &str, value: &LiteralValue, argnames: &[String], idx: usize) -> String {
     let first_argname = argnames.first().map(String::as_str).unwrap_or("arg");
-    if id.is_empty() {
+    if needs_positional_id(value, id) {
         format!("{}{}", first_argname, idx)
     } else if matches!(value, LiteralValue::Sequence(_)) {
         fill_opaque_placeholders(id, argnames, idx)
     } else {
         id.to_string()
+    }
+}
+
+/// True when pytest would use `argnameN`. Empty strings are real IDs (`test[]`); explicit `id=` is too.
+fn needs_positional_id(value: &LiteralValue, id: &str) -> bool {
+    match value {
+        LiteralValue::String(_) => false,
+        _ => id.is_empty(),
     }
 }
 
@@ -569,7 +577,7 @@ fn id_for_resolved_case_value(value: &LiteralValue, argnames: &[String], idx: us
             }
             _ => {
                 let id = literal_to_id_string(value);
-                if id.is_empty() {
+                if needs_positional_id(value, &id) {
                     format!(
                         "{}{}",
                         argnames.first().map(String::as_str).unwrap_or("arg"),
@@ -596,7 +604,7 @@ fn id_for_resolved_case_value(value: &LiteralValue, argnames: &[String], idx: us
                     }
                     _ => {
                         let id = literal_to_id_string(part);
-                        if id.is_empty() {
+                        if needs_positional_id(part, &id) {
                             format!(
                                 "{}{}",
                                 argnames.get(i).map(String::as_str).unwrap_or("arg"),
@@ -730,7 +738,16 @@ fn extract_literal(
         Expr::Call(call) if is_pytest_param(&call.func) => {
             extract_pytest_param(call, resolver, enclosing_class, id_style)
         }
-        // Function calls (including dataclass/class instantiation) - opaque
+        Expr::Call(call) if id_style == ParamIdStyle::RuntimeValue => {
+            // Constructors (`MyData(1)`) become objects; pytest uses argnameN. Helper calls that
+            // return str/int/enum must not be guessed as argnameN or workqueue will skip them.
+            if is_constructor_call(&call.func) {
+                Ok((LiteralValue::Opaque, String::new()))
+            } else {
+                Err(CannotExpandReason::FunctionCall(get_call_name(&call.func)))
+            }
+        }
+        // Function calls (including dataclass/class instantiation) - opaque for rtest.mark.cases
         Expr::Call(_) => Ok((LiteralValue::Opaque, String::new())),
         // Dict and set literals - opaque (we can count them but not stringify nicely)
         Expr::Dict(_) | Expr::Set(_) => Ok((LiteralValue::Opaque, String::new())),
@@ -758,6 +775,10 @@ fn extract_pytest_param(
     id_style: ParamIdStyle,
 ) -> Result<(LiteralValue, String), CannotExpandReason> {
     let custom_id = string_kwarg(&call.arguments.keywords, "id");
+    // Explicit id= is pytest-compatible even when the value is a helper call.
+    if let Some(id) = &custom_id {
+        return Ok((LiteralValue::Opaque, id.clone()));
+    }
     if call.arguments.args.is_empty() {
         return Ok((LiteralValue::Opaque, custom_id.unwrap_or_default()));
     }
@@ -869,7 +890,7 @@ fn extract_ids_kwarg(
 pub fn literal_to_id_string(value: &LiteralValue) -> String {
     match value {
         LiteralValue::Int(i) => i.to_string(),
-        LiteralValue::Float(f) => f.to_string(),
+        LiteralValue::Float(f) => python_str_float(*f),
         LiteralValue::String(s) => ascii_escape_string(s),
         LiteralValue::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         LiteralValue::None => "None".to_string(),
@@ -883,6 +904,40 @@ pub fn literal_to_id_string(value: &LiteralValue) -> String {
             class_name,
             member_name,
         } => format!("{}.{}", class_name, member_name),
+    }
+}
+
+/// Match Python `str(float)` so `0.0` is `0.0`, not Rust's `0`.
+fn python_str_float(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_negative() {
+            "-inf".to_string()
+        } else {
+            "inf".to_string()
+        };
+    }
+    if f == 0.0 && f.is_sign_negative() {
+        return "-0.0".to_string();
+    }
+    let mut s = f.to_string();
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        s.push_str(".0");
+    }
+    s
+}
+
+fn is_constructor_call(func: &Expr) -> bool {
+    match func {
+        Expr::Name(name) => name
+            .id
+            .as_str()
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_uppercase()),
+        _ => false,
     }
 }
 
@@ -1065,6 +1120,12 @@ mod tests {
         // Use 2.5 rather than 3.14: clippy::approx_constant treats 3.14 as π
         // and CI runs clippy with -D warnings.
         assert_eq!(literal_to_id_string(&LiteralValue::Float(2.5)), "2.5");
+        assert_eq!(literal_to_id_string(&LiteralValue::Float(0.0)), "0.0");
+        assert_eq!(literal_to_id_string(&LiteralValue::Float(1.0)), "1.0");
+        assert_eq!(
+            literal_to_id_string(&LiteralValue::String(String::new())),
+            ""
+        );
         assert_eq!(
             literal_to_id_string(&LiteralValue::String("hello".to_string())),
             "hello"
