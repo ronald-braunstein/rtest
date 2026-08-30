@@ -190,6 +190,8 @@ warning: Cannot statically expand test cases for 'test.py::test_dynamic': argval
 warning: Cannot statically expand test cases for 'test.py::test_comprehension': argvalues contains a comprehension
 ```
 
+Use `--cannot-expand-report` to control the extra machine-readable lines (`rtest-cannot-expand: <nodeid>`). The default is `stdout`. Pass `stderr`, a file path, or `none` to omit them (human-readable warnings still print).
+
 In these cases, test execution is still functionally equivalent - pytest automatically runs all parametrized variants
 when given the base function name.
 

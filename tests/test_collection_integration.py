@@ -2179,6 +2179,50 @@ class TestCollectionIntegration(unittest.TestCase):
             self.assertIn("rtest-cannot-expand: test_ids_fn.py::test_ids_fn", result.output)
             self.assertIn("collected 1 item", result.output)
 
+    def test_cannot_expand_report_none_omits_marker(self) -> None:
+        """--cannot-expand-report none keeps the warning but not the machine-readable line."""
+        files = {
+            "test_ids_fn.py": textwrap.dedent("""
+                import pytest
+
+                @pytest.mark.parametrize("value", [1, 2], ids=str)
+                def test_ids_fn(value):
+                    pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            result = run_collection(project_path, extra_args=["--cannot-expand-report", "none"])
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            assert_tests_found(result.output_lines, ["test_ids_fn.py::test_ids_fn"])
+            self.assertIn("Cannot statically expand", result.output)
+            self.assertNotIn("rtest-cannot-expand:", result.output)
+
+    def test_cannot_expand_report_file(self) -> None:
+        """--cannot-expand-report PATH writes records to the file, not stdout."""
+        files = {
+            "test_ids_fn.py": textwrap.dedent("""
+                import pytest
+
+                @pytest.mark.parametrize("value", [1, 2], ids=str)
+                def test_ids_fn(value):
+                    pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            report = project_path / "cannot-expand.txt"
+            result = run_collection(
+                project_path,
+                extra_args=["--cannot-expand-report", str(report)],
+            )
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            self.assertNotIn("rtest-cannot-expand:", result.stdout)
+            self.assertEqual(
+                report.read_text(),
+                "rtest-cannot-expand: test_ids_fn.py::test_ids_fn\n",
+            )
+
     def test_parametrize_imported_module_constants(self) -> None:
         """Imported constant lists expand with pytest-style value IDs."""
         files = {
