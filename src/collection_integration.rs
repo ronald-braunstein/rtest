@@ -3,6 +3,7 @@
 use crate::collection::error::{CollectionError, CollectionOutcome, CollectionWarning};
 use crate::collection::nodes::{collect_one_node, Session};
 use crate::collection::types::Collector;
+use crate::python_discovery::{cannot_expand_nodeid_from_message, format_cannot_expand_marker};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -169,6 +170,9 @@ pub fn display_collection_results(test_nodes: &[String], errors: &CollectionErro
         );
         for warning in &errors.warnings {
             println!("{YELLOW}{warning}{RESET}");
+            if let Some(nodeid) = cannot_expand_nodeid_from_message(&warning.message) {
+                println!("{}", format_cannot_expand_marker(nodeid));
+            }
         }
         println!("-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html");
     }
