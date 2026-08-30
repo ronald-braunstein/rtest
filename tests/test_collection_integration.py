@@ -2348,6 +2348,62 @@ class TestCollectionIntegration(unittest.TestCase):
             self.assertIn("rtest-cannot-expand: test_unresolved.py::test_unknown", result.output)
             self.assertIn("collected 1 item", result.output)
 
+    def test_parametrize_starred_unpack_is_unexpanded(self) -> None:
+        """Star-unpack in argvalues cannot be counted statically; peach falls back to pytest."""
+        files = {
+            "test_star.py": textwrap.dedent("""
+                import pytest
+
+                IGNORED = [".gitignore", ".mcp.json"]
+
+                @pytest.mark.parametrize("ignored_file", [*IGNORED, "README.md"])
+                def test_ignored(ignored_file):
+                    pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            result = run_collection(project_path)
+
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            assert_tests_found(result.output_lines, ["test_star.py::test_ignored"])
+            self.assertNotIn("ignored_file0", result.output)
+            self.assertIn("Cannot statically expand", result.output)
+            self.assertIn("rtest-cannot-expand: test_star.py::test_ignored", result.output)
+
+    def test_parametrize_int_binop_and_lambda_match_pytest(self) -> None:
+        """Integer ops fold to pytest IDs; lambdas use __name__ (`<lambda>`)."""
+        files = {
+            "test_ops.py": textwrap.dedent("""
+                import pytest
+
+                @pytest.mark.parametrize("seconds", [360 * 60, 1 << 31])
+                def test_seconds(seconds):
+                    pass
+
+                @pytest.mark.parametrize("elements, predicate, result", [
+                    ([1], lambda x: x == 1, 1),
+                ])
+                def test_first(elements, predicate, result):
+                    pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            result = run_collection(project_path)
+
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            assert_tests_found(
+                result.output_lines,
+                [
+                    "test_ops.py::test_seconds[21600]",
+                    "test_ops.py::test_seconds[2147483648]",
+                    "test_ops.py::test_first[elements0-<lambda>-1]",
+                ],
+            )
+            self.assertNotIn("seconds0", result.output)
+            self.assertNotIn("predicate0", result.output)
+
     def test_parametrize_helper_call_is_unexpanded(self) -> None:
         """Helper calls that return str/int must not become argnameN (pytest uses str(result))."""
         files = {
@@ -2385,6 +2441,10 @@ class TestCollectionIntegration(unittest.TestCase):
                 @pytest.mark.parametrize("first_name", ["", "bob"])
                 def test_name(first_name):
                     pass
+
+                @pytest.mark.parametrize("memo", ["Ñoño"])
+                def test_memo(memo):
+                    pass
             """),
         }
 
@@ -2399,10 +2459,60 @@ class TestCollectionIntegration(unittest.TestCase):
                     "test_ids.py::test_rate[1.0]",
                     "test_ids.py::test_name[]",
                     "test_ids.py::test_name[bob]",
+                    r"test_ids.py::test_memo[\xd1o\xf1o]",
                 ],
             )
             self.assertFalse(any(line.strip().endswith("::test_rate[0]") for line in result.output_lines))
             self.assertNotIn("first_name0", result.output)
+
+    def test_parametrize_bytes_one_tuple_and_pytest_duplicate_ids(self) -> None:
+        """Bytes IDs, 1-tuples, and pytest 7.3 duplicate suffixes (`id0`/`id1`)."""
+        files = {
+            "test_more_ids.py": textwrap.dedent("""
+                import pytest
+
+                @pytest.mark.parametrize("csv_content", [b"id,amount\\n1,100"])
+                def test_csv(csv_content):
+                    pass
+
+                @pytest.mark.parametrize(("admin_action",), [("deactivate",), ("delete",)])
+                def test_action(admin_action):
+                    pass
+
+                @pytest.mark.parametrize("evaluate_all", [(True,), (False,)])
+                def test_flag(evaluate_all):
+                    pass
+
+                @pytest.mark.parametrize("sids", [[], ["WFLD-missing"]])
+                def test_sids(sids):
+                    pass
+
+                @pytest.mark.parametrize("flag", [False, False])
+                def test_dup(flag):
+                    pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            result = run_collection(project_path)
+
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            assert_tests_found(
+                result.output_lines,
+                [
+                    r"test_more_ids.py::test_csv[id,amount\n1,100]",
+                    "test_more_ids.py::test_action[deactivate]",
+                    "test_more_ids.py::test_action[delete]",
+                    "test_more_ids.py::test_flag[evaluate_all0]",
+                    "test_more_ids.py::test_flag[evaluate_all1]",
+                    "test_more_ids.py::test_sids[sids0]",
+                    "test_more_ids.py::test_sids[sids1]",
+                    "test_more_ids.py::test_dup[False0]",
+                    "test_more_ids.py::test_dup[False1]",
+                ],
+            )
+            self.assertNotIn("admin_action0", result.output)
+            self.assertNotIn("csv_content0", result.output)
 
     def test_mark_parametrize_and_pytest_param_ids(self) -> None:
         """`@mark.parametrize` is recognized; pytest.param(id=) is used for case IDs."""

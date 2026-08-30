@@ -41,6 +41,8 @@ pub struct CasesSpec {
     pub value_ids: Vec<String>,
     /// Optional custom IDs for each case (overrides `value_ids`).
     pub ids: Option<Vec<String>>,
+    /// pytest 7.3 suffixes duplicate IDs as `{id}0`, `{id}1` (no underscore).
+    pub pytest_unique_ids: bool,
 }
 
 /// Parsed decorator information (specs, not yet expanded).
@@ -261,7 +263,7 @@ fn parse_single_decorator(
         ));
     }
 
-    let argnames = match extract_argnames(&call.arguments.args[0]) {
+    let (argnames, unpack_rows) = match extract_argnames(&call.arguments.args[0]) {
         Ok(names) => names,
         Err(reason) => return DecoratorParseResult::CannotExpand(reason),
     };
@@ -272,6 +274,7 @@ fn parse_single_decorator(
         enclosing_class,
         &argnames,
         id_style,
+        unpack_rows,
     ) {
         Ok(result) => result,
         Err(reason) => return DecoratorParseResult::CannotExpand(reason),
@@ -299,6 +302,7 @@ fn parse_single_decorator(
         argvalues,
         value_ids,
         ids,
+        pytest_unique_ids: id_style == ParamIdStyle::RuntimeValue,
     })
 }
 
@@ -344,7 +348,7 @@ fn decorator_id_style(func: &Expr) -> Option<ParamIdStyle> {
 }
 
 /// Extract argument names from the first decorator argument.
-fn extract_argnames(expr: &Expr) -> Result<Vec<String>, CannotExpandReason> {
+fn extract_argnames(expr: &Expr) -> Result<(Vec<String>, bool), CannotExpandReason> {
     match expr {
         Expr::StringLiteral(s) => {
             let names: Vec<String> = s
@@ -359,7 +363,8 @@ fn extract_argnames(expr: &Expr) -> Result<Vec<String>, CannotExpandReason> {
                     "empty argnames".to_string(),
                 ))
             } else {
-                Ok(names)
+                // `"evaluate_all"` is one value; `"a, b"` unpacks each row.
+                Ok((names, false))
             }
         }
         // Support list/tuple of strings: ["a", "b", "c"] or ("a", "b", "c")
@@ -382,7 +387,7 @@ fn extract_argnames(expr: &Expr) -> Result<Vec<String>, CannotExpandReason> {
                     "empty argnames".to_string(),
                 ))
             } else {
-                Ok(names)
+                Ok((names, true))
             }
         }
         Expr::Name(name) => Err(CannotExpandReason::VariableReference(name.id.to_string())),
@@ -428,7 +433,14 @@ fn extract_argvalues(
     enclosing_class: Option<&str>,
     argnames: &[String],
     id_style: ParamIdStyle,
+    unpack_rows: bool,
 ) -> Result<(Vec<LiteralValue>, Vec<String>), CannotExpandReason> {
+    if contains_starred(expr) {
+        return Err(CannotExpandReason::UnsupportedExpression(
+            "starred unpack in argvalues".to_string(),
+        ));
+    }
+
     let first_argname = argnames.first().map(|s| s.as_str()).unwrap_or("arg");
 
     match expr {
@@ -437,7 +449,15 @@ fn extract_argvalues(
             let mut ids = Vec::with_capacity(elts.len());
             for (idx, elt) in elts.iter().enumerate() {
                 let (value, id) = if id_style == ParamIdStyle::RuntimeValue {
-                    extract_pytest_case(elt, argnames, idx, resolver, enclosing_class, id_style)?
+                    extract_pytest_case(
+                        elt,
+                        argnames,
+                        idx,
+                        resolver,
+                        enclosing_class,
+                        id_style,
+                        unpack_rows,
+                    )?
                 } else {
                     let (value, id) = extract_literal(elt, resolver, enclosing_class, id_style)?;
                     let final_id = if id.is_empty() {
@@ -507,12 +527,27 @@ fn extract_pytest_case(
     resolver: Option<&ConstantResolver>,
     enclosing_class: Option<&str>,
     id_style: ParamIdStyle,
+    unpack_rows: bool,
 ) -> Result<(LiteralValue, String), CannotExpandReason> {
     if let Expr::Call(call) = elt {
         if is_pytest_param(&call.func) {
             let (value, id) = extract_pytest_param(call, resolver, enclosing_class, id_style)?;
             let final_id = finalize_pytest_id(&id, &value, argnames, idx);
             return Ok((value, final_id));
+        }
+    }
+
+    // pytest unpacks a 1-tuple row only when argnames is a list/tuple of names,
+    // e.g. `("admin_action",)` + `("deactivate",)`. A string argnames `"x"` plus
+    // `[(True,)]` keeps the tuple as the value (ID `x0`). Never unwrap lists:
+    // `[["WFLD-missing"]]` is a list value, not one unpacked string.
+    if unpack_rows && argnames.len() == 1 {
+        if let Expr::Tuple(ExprTuple { elts, .. }) = elt {
+            if let [only] = elts.as_slice() {
+                let (value, id) = extract_literal(only, resolver, enclosing_class, id_style)?;
+                let final_id = finalize_pytest_id(&id, &value, argnames, idx);
+                return Ok((value, final_id));
+            }
         }
     }
 
@@ -537,6 +572,46 @@ fn extract_pytest_case(
     let (value, id) = extract_literal(elt, resolver, enclosing_class, id_style)?;
     let final_id = finalize_pytest_id(&id, &value, argnames, idx);
     Ok((value, final_id))
+}
+
+fn contains_starred(expr: &Expr) -> bool {
+    match expr {
+        Expr::Starred(_) => true,
+        Expr::List(ExprList { elts, .. }) | Expr::Tuple(ExprTuple { elts, .. }) => {
+            elts.iter().any(contains_starred)
+        }
+        Expr::Call(call) => call.arguments.args.iter().any(contains_starred),
+        _ => false,
+    }
+}
+
+fn eval_literal_binop(
+    op: ruff_python_ast::Operator,
+    left: &LiteralValue,
+    right: &LiteralValue,
+) -> Option<LiteralValue> {
+    use ruff_python_ast::Operator;
+    if let (LiteralValue::String(a), LiteralValue::String(b), Operator::Add) = (left, right, op) {
+        return Some(LiteralValue::String(format!("{a}{b}")));
+    }
+    let (LiteralValue::Int(l), LiteralValue::Int(r)) = (left, right) else {
+        return None;
+    };
+    let value = match op {
+        Operator::Add => l.checked_add(*r)?,
+        Operator::Sub => l.checked_sub(*r)?,
+        Operator::Mult => l.checked_mul(*r)?,
+        Operator::FloorDiv if *r != 0 => l.div_euclid(*r),
+        Operator::Mod if *r != 0 => l.rem_euclid(*r),
+        Operator::LShift if (0..64).contains(r) => l.checked_shl(*r as u32)?,
+        Operator::RShift if (0..64).contains(r) => l.checked_shr(*r as u32)?,
+        Operator::BitOr => *l | *r,
+        Operator::BitXor => *l ^ *r,
+        Operator::BitAnd => *l & *r,
+        Operator::Pow if *r >= 0 && *r <= 63 => l.checked_pow(*r as u32)?,
+        _ => return None,
+    };
+    Some(LiteralValue::Int(value))
 }
 
 fn sequence_elts(expr: &Expr) -> Option<&[Expr]> {
@@ -670,6 +745,13 @@ fn extract_literal(
             let id = literal_to_id_string(&lit);
             Ok((lit, id))
         }
+        Expr::BytesLiteral(bytes) => {
+            // pytest STRING_TYPES includes bytes; IDs use ascii_escaped(decode).
+            let s: String = bytes.value.bytes().map(char::from).collect();
+            let lit = LiteralValue::String(s);
+            let id = literal_to_id_string(&lit);
+            Ok((lit, id))
+        }
         Expr::BooleanLiteral(b) => {
             let lit = LiteralValue::Bool(b.value);
             let id = literal_to_id_string(&lit);
@@ -695,6 +777,28 @@ fn extract_literal(
                 _ => Ok((LiteralValue::Opaque, String::new())),
             }
         }
+        Expr::BinOp(binop) => {
+            let (left, _) = extract_literal(&binop.left, resolver, enclosing_class, id_style)?;
+            let (right, _) = extract_literal(&binop.right, resolver, enclosing_class, id_style)?;
+            if let Some(lit) = eval_literal_binop(binop.op, &left, &right) {
+                let id = literal_to_id_string(&lit);
+                return Ok((lit, id));
+            }
+            if id_style == ParamIdStyle::RuntimeValue {
+                return Err(CannotExpandReason::UnsupportedExpression(format!(
+                    "binary op '{}'",
+                    binop.op.as_str()
+                )));
+            }
+            Ok((LiteralValue::Opaque, String::new()))
+        }
+        Expr::Lambda(_) if id_style == ParamIdStyle::RuntimeValue => {
+            // pytest `_idval_from_value` uses `__name__` → `<lambda>`.
+            Ok((LiteralValue::Opaque, "<lambda>".to_string()))
+        }
+        Expr::Starred(_) => Err(CannotExpandReason::UnsupportedExpression(
+            "starred unpack".to_string(),
+        )),
         Expr::NoneLiteral(_) => {
             let lit = LiteralValue::None;
             let id = literal_to_id_string(&lit);
@@ -957,8 +1061,12 @@ fn ascii_escape_string(s: &str) -> String {
             }
             c if c.is_ascii() => result.push(c),
             c => {
+                // Match Python `str.encode("unicode_escape")` / pytest `ascii_escaped`:
+                // latin-1 is `\xHH`, BMP `\uXXXX`, supplementary `\UXXXXXXXX`.
                 let code = c as u32;
-                if code <= 0xFFFF {
+                if code <= 0xFF {
+                    result.push_str(&format!("\\x{:02x}", code));
+                } else if code <= 0xFFFF {
                     result.push_str(&format!("\\u{:04x}", code));
                 } else {
                     result.push_str(&format!("\\U{:08x}", code));
@@ -992,8 +1100,13 @@ pub fn expand_cases(specs: &[CasesSpec]) -> Vec<ExpandedCase> {
     }
 
     let ids: Vec<String> = result.iter().map(|parts| parts.join("-")).collect();
+    let unique = if specs.iter().any(|spec| spec.pytest_unique_ids) {
+        deduplicate_ids_pytest(ids)
+    } else {
+        deduplicate_ids(ids)
+    };
 
-    deduplicate_ids(ids)
+    unique
         .into_iter()
         .map(|case_id| ExpandedCase { case_id })
         .collect()
@@ -1014,6 +1127,27 @@ fn expand_single_spec(spec: &CasesSpec) -> Vec<String> {
         // Use pre-computed value_ids (from literals or resolved source paths)
         spec.value_ids.clone()
     }
+}
+
+/// pytest 7.3: every copy of a duplicated ID gets a trailing counter, including the first (`id0`, `id1`).
+fn deduplicate_ids_pytest(ids: Vec<String>) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for id in &ids {
+        *counts.entry(id.clone()).or_insert(0) += 1;
+    }
+    let mut suffixes: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    ids.into_iter()
+        .map(|id| {
+            if counts.get(&id).copied().unwrap_or(0) > 1 {
+                let n = suffixes.entry(id.clone()).or_insert(0);
+                let unique = format!("{id}{n}");
+                *n += 1;
+                unique
+            } else {
+                id
+            }
+        })
+        .collect()
 }
 
 /// Deduplicate IDs by adding `_1`, `_2` suffixes for duplicates.
@@ -1056,6 +1190,19 @@ mod tests {
     }
 
     #[test]
+    fn test_deduplicate_ids_pytest_suffixes_all_copies() {
+        let ids = vec![
+            "True-True-True-False".to_string(),
+            "True-True-True-False".to_string(),
+            "unique".to_string(),
+        ];
+        assert_eq!(
+            deduplicate_ids_pytest(ids),
+            vec!["True-True-True-False0", "True-True-True-False1", "unique"]
+        );
+    }
+
+    #[test]
     fn test_expand_single_spec_numeric() {
         let spec = CasesSpec {
             argnames: vec!["x".to_string()],
@@ -1066,6 +1213,7 @@ mod tests {
             ],
             value_ids: vec!["1".to_string(), "2".to_string(), "3".to_string()],
             ids: None,
+            pytest_unique_ids: false,
         };
         assert_eq!(expand_single_spec(&spec), vec!["1", "2", "3"]);
     }
@@ -1085,6 +1233,7 @@ mod tests {
                 "two".to_string(),
                 "three".to_string(),
             ]),
+            pytest_unique_ids: false,
         };
         assert_eq!(expand_single_spec(&spec), vec!["one", "two", "three"]);
     }
@@ -1097,6 +1246,7 @@ mod tests {
                 argvalues: vec![LiteralValue::Int(1), LiteralValue::Int(2)],
                 value_ids: vec!["1".to_string(), "2".to_string()],
                 ids: None,
+                pytest_unique_ids: false,
             },
             CasesSpec {
                 argnames: vec!["y".to_string()],
@@ -1106,6 +1256,7 @@ mod tests {
                 ],
                 value_ids: vec!["a".to_string(), "b".to_string()],
                 ids: None,
+                pytest_unique_ids: false,
             },
         ];
         let cases = expand_cases(&specs);
@@ -1176,6 +1327,7 @@ mod tests {
             argvalues: vec![],
             value_ids: vec![],
             ids: None,
+            pytest_unique_ids: false,
         };
         assert_eq!(expand_single_spec(&spec), Vec::<String>::new());
     }
@@ -1189,7 +1341,9 @@ mod tests {
 
     #[test]
     fn test_ascii_escape_string_unicode() {
-        // Non-ASCII to Unicode escape
+        // Latin-1 matches Python unicode_escape / pytest ascii_escaped (`\xHH`).
+        assert_eq!(ascii_escape_string("Ñoño"), "\\xd1o\\xf1o");
+        // Non-ASCII BMP to Unicode escape
         assert_eq!(ascii_escape_string("☃"), "\\u2603");
         assert_eq!(ascii_escape_string("\"☃\""), "\"\\u2603\"");
 
@@ -1229,6 +1383,7 @@ mod tests {
             argvalues: vec![LiteralValue::Int(1), LiteralValue::Int(2)],
             value_ids: vec!["1".to_string(), "2".to_string()],
             ids: None,
+            pytest_unique_ids: false,
         }]);
         let method_specs = MethodCasesInfo::NotDecorated;
 
@@ -1252,6 +1407,7 @@ mod tests {
             argvalues: vec![LiteralValue::Int(1), LiteralValue::Int(2)],
             value_ids: vec!["1".to_string(), "2".to_string()],
             ids: None,
+            pytest_unique_ids: false,
         }]);
         let method_specs = MethodCasesInfo::Specs(vec![CasesSpec {
             argnames: vec!["y".to_string()],
@@ -1261,6 +1417,7 @@ mod tests {
             ],
             value_ids: vec!["a".to_string(), "b".to_string()],
             ids: None,
+            pytest_unique_ids: false,
         }]);
 
         let result = combine_and_expand_specs(&class_specs, &method_specs);
