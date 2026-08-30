@@ -1062,6 +1062,8 @@ mod tests {
     #[test]
     fn test_literal_to_id_string() {
         assert_eq!(literal_to_id_string(&LiteralValue::Int(42)), "42");
+        // Use 2.5 rather than 3.14: clippy::approx_constant treats 3.14 as π
+        // and CI runs clippy with -D warnings.
         assert_eq!(literal_to_id_string(&LiteralValue::Float(2.5)), "2.5");
         assert_eq!(
             literal_to_id_string(&LiteralValue::String("hello".to_string())),
