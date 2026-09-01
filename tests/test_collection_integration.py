@@ -1808,6 +1808,80 @@ class TestCollectionIntegration(unittest.TestCase):
             assert_tests_found(result.output_lines, expected_patterns)
             self.assertIn("collected 3 items", result.output)
 
+    def test_parametrize_stdlib_datetime_constructors_expand(self) -> None:
+        """date/datetime/timedelta/time are constructors; pytest IDs them as argnameN."""
+        files = {
+            "test_dates.py": textwrap.dedent("""
+                from datetime import date, datetime, timedelta, time
+                import datetime as dt
+                import pytest
+
+                @pytest.mark.parametrize("when", [date(2024, 2, 14), date(2024, 2, 15)])
+                def test_date(when):
+                    pass
+
+                @pytest.mark.parametrize("when", [datetime(2024, 1, 1), dt.datetime(2024, 1, 2)])
+                def test_datetime(when):
+                    pass
+
+                @pytest.mark.parametrize("delta", [timedelta(days=1), dt.timedelta(hours=2)])
+                def test_timedelta(delta):
+                    pass
+
+                @pytest.mark.parametrize("clock", [time(9, 0), dt.time(17, 30)])
+                def test_time(clock):
+                    pass
+
+                @pytest.mark.parametrize("when", [dt.date(2024, 1, 1)])
+                def test_datetime_date(when):
+                    pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            result = run_collection(project_path)
+
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            expected_patterns = [
+                "test_dates.py::test_date[when0]",
+                "test_dates.py::test_date[when1]",
+                "test_dates.py::test_datetime[when0]",
+                "test_dates.py::test_datetime[when1]",
+                "test_dates.py::test_timedelta[delta0]",
+                "test_dates.py::test_timedelta[delta1]",
+                "test_dates.py::test_time[clock0]",
+                "test_dates.py::test_time[clock1]",
+                "test_dates.py::test_datetime_date[when0]",
+            ]
+            assert_tests_found(result.output_lines, expected_patterns)
+            self.assertNotIn("Cannot statically expand", result.output)
+            self.assertIn("collected 9 items", result.output)
+
+    def test_parametrize_str_to_date_helper_is_unexpanded(self) -> None:
+        """Non-constructor date helpers still CannotExpand (pytest IDs the returned date as argnameN)."""
+        files = {
+            "test_str_to_date.py": textwrap.dedent("""
+                from datetime import date
+                import pytest
+
+                def str_to_date(value):
+                    return date.fromisoformat(value)
+
+                @pytest.mark.parametrize("when", [str_to_date("2024-01-01")])
+                def test_parsed(when):
+                    pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            result = run_collection(project_path)
+
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            assert_tests_found(result.output_lines, ["test_str_to_date.py::test_parsed"])
+            self.assertNotIn("when0", result.output)
+            self.assertIn("Cannot statically expand", result.output)
+            self.assertIn("rtest-cannot-expand: test_str_to_date.py::test_parsed", result.output)
+
     def test_parametrize_with_nested_dicts(self) -> None:
         """Test that @parametrize with nested dicts generates positional IDs (issue #134)."""
         files = {
