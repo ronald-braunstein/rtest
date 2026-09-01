@@ -7,7 +7,7 @@ build-backend = "maturin"
 
 [project]
 name = "rtest-forked-constants"
-version = "0.0.47rc1"
+version = "0.0.47rc2"
 description = "Temporary PyPI fork of rtest with pytest-compatible parametrize IDs (hughhan1/rtest#151). Import and CLI remain `rtest`."
 readme = "README.md"
 requires-python = ">=3.10"
