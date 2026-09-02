@@ -2704,6 +2704,73 @@ class TestCollectionIntegration(unittest.TestCase):
             self.assertNotIn("test_call[1]", result.output)
             self.assertIn("collected 2 items", result.output)
 
+    def test_parametrized_fixture_cannot_expand(self) -> None:
+        """@pytest.fixture(params=...) changes pytest nodeids; rtest CannotExpands instead of emitting unparameterized names."""
+        files = {
+            "test_loan_extract.py": textwrap.dedent("""
+                import pytest
+
+                class TestLoanExtractCrons:
+                    @pytest.fixture(params=[False, True], autouse=True)
+                    def _set_loan_extract_cutover_flag(self, request):
+                        pass
+
+                    def test_progression(self):
+                        pass
+
+                    def test_daily(self):
+                        pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            result = run_collection(project_path)
+
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            assert_tests_found(
+                result.output_lines,
+                [
+                    "test_loan_extract.py::TestLoanExtractCrons::test_progression",
+                    "test_loan_extract.py::TestLoanExtractCrons::test_daily",
+                ],
+            )
+            self.assertNotIn("test_progression[False]", result.output)
+            self.assertNotIn("test_progression[True]", result.output)
+            self.assertIn("Cannot statically expand", result.output)
+            self.assertIn(
+                "rtest-cannot-expand: test_loan_extract.py::TestLoanExtractCrons::test_progression",
+                result.output,
+            )
+            self.assertIn(
+                "rtest-cannot-expand: test_loan_extract.py::TestLoanExtractCrons::test_daily",
+                result.output,
+            )
+            self.assertIn("collected 2 items", result.output)
+
+    def test_fixture_without_params_does_not_cannot_expand(self) -> None:
+        """Plain @pytest.fixture does not change nodeids."""
+        files = {
+            "test_plain_fixture.py": textwrap.dedent("""
+                import pytest
+
+                class TestExample:
+                    @pytest.fixture(autouse=True)
+                    def _setup(self):
+                        pass
+
+                    def test_ok(self):
+                        pass
+            """),
+        }
+
+        with create_test_project(files) as project_path:
+            result = run_collection(project_path)
+
+            self.assertEqual(result.returncode, 0, f"Collection failed: {result.output}")
+            assert_tests_found(result.output_lines, ["test_plain_fixture.py::TestExample::test_ok"])
+            self.assertNotIn("Cannot statically expand", result.output)
+            self.assertIn("collected 1 item", result.output)
+
     def test_stdlib_inheritance_skipped_gracefully(self) -> None:
         """Test that inheriting from stdlib classes doesn't crash collection (issue #131)."""
         files = {

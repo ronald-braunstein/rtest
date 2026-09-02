@@ -2,8 +2,8 @@
 
 use crate::python_discovery::{
     cases::{
-        combine_and_expand_specs, parse_decorators_for_cases, parse_decorators_to_specs,
-        MethodCasesInfo,
+        combine_and_expand_specs, module_has_parametrized_fixture, parse_decorators_for_cases,
+        parse_decorators_to_specs, with_parametrized_fixture, MethodCasesInfo,
     },
     constant_resolver::ConstantResolver,
     discovery::{class_has_init, TestDiscoveryConfig, TestInfo},
@@ -36,6 +36,8 @@ pub(crate) struct TestDiscoveryVisitor {
     current_class: Option<String>,
     /// Maps class names to cached class info for inheritance resolution
     class_cache: HashMap<String, CachedClassInfo>,
+    /// File has `@pytest.fixture(params=...)`; pytest IDs include those params.
+    parametrized_fixture: bool,
 }
 
 impl TestDiscoveryVisitor {
@@ -45,12 +47,14 @@ impl TestDiscoveryVisitor {
             tests: Vec::new(),
             current_class: None,
             class_cache: HashMap::new(),
+            parametrized_fixture: false,
         }
     }
 
     pub fn visit_module(&mut self, module: &ModModule) {
         // Build constant resolver for this module
         let resolver = ConstantResolver::from_module(module);
+        self.parametrized_fixture = module_has_parametrized_fixture(module);
 
         // First pass: collect all test classes and their methods (specs only, not expanded)
         self.collect_class_info(module, &resolver);
@@ -111,10 +115,13 @@ impl TestDiscoveryVisitor {
     fn visit_function(&mut self, func: &StmtFunctionDef, resolver: &ConstantResolver) {
         let name = func.name.as_str();
         if self.is_test_function(name) {
-            let cases_expansion = parse_decorators_for_cases(
-                &func.decorator_list,
-                Some(resolver),
-                self.current_class.as_deref(),
+            let cases_expansion = with_parametrized_fixture(
+                parse_decorators_for_cases(
+                    &func.decorator_list,
+                    Some(resolver),
+                    self.current_class.as_deref(),
+                ),
+                self.parametrized_fixture,
             );
             self.tests.push(TestInfo {
                 name: name.into(),
@@ -174,8 +181,10 @@ impl TestDiscoveryVisitor {
 
                             // Combine CHILD class specs with PARENT method specs
                             // This is the key fix: inherited methods get the child's class decorators
-                            let cases_expansion =
-                                combine_and_expand_specs(&class_specs, &parent_method.method_specs);
+                            let cases_expansion = with_parametrized_fixture(
+                                combine_and_expand_specs(&class_specs, &parent_method.method_specs),
+                                self.parametrized_fixture,
+                            );
 
                             self.tests.push(TestInfo {
                                 name: parent_method.name.clone(),
@@ -200,7 +209,10 @@ impl TestDiscoveryVisitor {
                         Some(resolver),
                         Some(class_name),
                     );
-                    let cases_expansion = combine_and_expand_specs(&class_specs, &method_specs);
+                    let cases_expansion = with_parametrized_fixture(
+                        combine_and_expand_specs(&class_specs, &method_specs),
+                        self.parametrized_fixture,
+                    );
 
                     self.tests.push(TestInfo {
                         name: method_name.into(),

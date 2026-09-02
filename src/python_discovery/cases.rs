@@ -3,7 +3,10 @@
 //! This module extracts test case information from decorator AST nodes and expands
 //! parametrized tests into individual test cases during collection.
 
-use ruff_python_ast::{Decorator, Expr, ExprAttribute, ExprList, ExprName, ExprTuple, Keyword};
+use ruff_python_ast::{
+    Decorator, Expr, ExprAttribute, ExprList, ExprName, ExprTuple, Keyword, ModModule, Stmt,
+    StmtFunctionDef,
+};
 
 use super::constant_resolver::ConstantResolver;
 
@@ -70,6 +73,8 @@ pub enum CannotExpandReason {
     Comprehension,
     /// Catch-all for other unsupported expressions.
     UnsupportedExpression(String),
+    /// `@pytest.fixture(params=...)` parametrizes nodeids (including autouse fixtures).
+    ParametrizedFixture,
 }
 
 impl std::fmt::Display for CannotExpandReason {
@@ -86,6 +91,12 @@ impl std::fmt::Display for CannotExpandReason {
             }
             Self::UnsupportedExpression(desc) => {
                 write!(f, "argvalues contains unsupported expression: {}", desc)
+            }
+            Self::ParametrizedFixture => {
+                write!(
+                    f,
+                    "@pytest.fixture(params=...) parametrizes collected nodeids"
+                )
             }
         }
     }
@@ -141,6 +152,62 @@ enum ParamIdStyle {
     SourcePath,
     /// `@pytest.mark.parametrize`: match pytest IDs (runtime values; `str(enum)`).
     RuntimeValue,
+}
+
+/// True when this decorator is `@pytest.fixture(..., params=...)` or `@fixture(..., params=...)`.
+///
+/// `params=None` is pytest's default and does not change nodeids.
+pub fn decorator_is_parametrized_fixture(decorator: &Decorator) -> bool {
+    let Expr::Call(call) = &decorator.expression else {
+        return false;
+    };
+    if !is_pytest_fixture(&call.func) {
+        return false;
+    }
+    call.arguments.keywords.iter().any(|kw| {
+        kw.arg.as_ref().is_some_and(|arg| arg.as_str() == "params")
+            && !matches!(kw.value, Expr::NoneLiteral(_))
+    })
+}
+
+fn is_pytest_fixture(func: &Expr) -> bool {
+    match func {
+        Expr::Name(name) => name.id.as_str() == "fixture",
+        Expr::Attribute(ExprAttribute { attr, value, .. }) if attr.as_str() == "fixture" => {
+            matches!(value.as_ref(), Expr::Name(name) if name.id.as_str() == "pytest")
+        }
+        _ => false,
+    }
+}
+
+fn function_has_parametrized_fixture(func: &StmtFunctionDef) -> bool {
+    func.decorator_list
+        .iter()
+        .any(decorator_is_parametrized_fixture)
+}
+
+/// True when any function in the module (including class methods) is a parametrized fixture.
+///
+/// Pytest includes those params in every affected test's nodeid. rtest does not expand
+/// fixture params, so callers should CannotExpand rather than emit unparameterized names.
+pub fn module_has_parametrized_fixture(module: &ModModule) -> bool {
+    fn stmts_have(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|stmt| match stmt {
+            Stmt::FunctionDef(func) => function_has_parametrized_fixture(func),
+            Stmt::ClassDef(class) => stmts_have(&class.body),
+            _ => false,
+        })
+    }
+    stmts_have(&module.body)
+}
+
+/// Replace expansion with CannotExpand when the file has `@pytest.fixture(params=...)`.
+pub fn with_parametrized_fixture(expansion: CasesExpansion, affected: bool) -> CasesExpansion {
+    if affected {
+        CasesExpansion::CannotExpand(CannotExpandReason::ParametrizedFixture)
+    } else {
+        expansion
+    }
 }
 
 /// Parse decorators and return the cases expansion result.

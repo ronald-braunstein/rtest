@@ -11,8 +11,8 @@ use std::path::Path;
 use crate::collection::error::{CollectionError, CollectionResult, CollectionWarning};
 use crate::python_discovery::{
     cases::{
-        combine_and_expand_specs, parse_decorators_for_cases, parse_decorators_to_specs,
-        MethodCasesInfo,
+        combine_and_expand_specs, module_has_parametrized_fixture, parse_decorators_for_cases,
+        parse_decorators_to_specs, with_parametrized_fixture, MethodCasesInfo,
     },
     constant_resolver::ConstantResolver,
     discovery::{class_has_init, TestDiscoveryConfig, TestInfo},
@@ -68,6 +68,8 @@ pub struct SemanticTestDiscovery {
     warnings: Vec<CollectionWarning>,
     /// Current file path for warning generation
     current_file_path: Option<String>,
+    /// File has `@pytest.fixture(params=...)`; pytest IDs include those params.
+    parametrized_fixture: bool,
 }
 
 impl SemanticTestDiscovery {
@@ -77,6 +79,7 @@ impl SemanticTestDiscovery {
             class_cache: HashMap::new(),
             warnings: Vec::new(),
             current_file_path: None,
+            parametrized_fixture: false,
         }
     }
 
@@ -104,6 +107,7 @@ impl SemanticTestDiscovery {
         // Build constant resolver for this module, following project-local imports
         let resolver =
             ConstantResolver::from_module_with_imports(&ast_module, &module_path, module_resolver);
+        self.parametrized_fixture = module_has_parametrized_fixture(&ast_module);
 
         // Build semantic model
         let semantic_module = SemanticModule {
@@ -133,8 +137,10 @@ impl SemanticTestDiscovery {
         for stmt in &ast_module.body {
             if let Stmt::FunctionDef(func) = stmt {
                 if self.is_test_function(func.name.as_str()) {
-                    let cases_expansion =
-                        parse_decorators_for_cases(&func.decorator_list, Some(&resolver), None);
+                    let cases_expansion = with_parametrized_fixture(
+                        parse_decorators_for_cases(&func.decorator_list, Some(&resolver), None),
+                        self.parametrized_fixture,
+                    );
                     all_tests.push(TestInfo {
                         name: func.name.to_string(),
                         line: func.range().start().to_u32() as usize,
@@ -425,8 +431,10 @@ impl SemanticTestDiscovery {
 
                                 // Combine CHILD class specs with PARENT method specs
                                 // This is the key fix: inherited methods get the child's class decorators
-                                let cases_expansion =
-                                    combine_and_expand_specs(&class_specs, &method.method_specs);
+                                let cases_expansion = with_parametrized_fixture(
+                                    combine_and_expand_specs(&class_specs, &method.method_specs),
+                                    self.parametrized_fixture,
+                                );
 
                                 all_tests.push(TestInfo {
                                     name: method.name.clone(),
@@ -456,7 +464,10 @@ impl SemanticTestDiscovery {
                         Some(resolver),
                         Some(class_name),
                     );
-                    let cases_expansion = combine_and_expand_specs(&class_specs, &method_specs);
+                    let cases_expansion = with_parametrized_fixture(
+                        combine_and_expand_specs(&class_specs, &method_specs),
+                        self.parametrized_fixture,
+                    );
 
                     all_tests.push(TestInfo {
                         name: method_name.to_string(),

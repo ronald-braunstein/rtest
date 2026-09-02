@@ -460,6 +460,67 @@ class TestChild(TestParent):
     }
 
     #[test]
+    fn test_parametrized_fixture_cannot_expand() {
+        let source = r#"
+import pytest
+
+class TestLoanExtract:
+    @pytest.fixture(params=[False, True], autouse=True)
+    def _set_flag(self, request):
+        pass
+
+    def test_plain(self):
+        pass
+
+    @pytest.mark.parametrize("x", [1, 2])
+    def test_param(self, x):
+        pass
+"#;
+
+        let config = TestDiscoveryConfig::default();
+        let tests = discover_tests(&PathBuf::from("test.py"), source, &config).unwrap();
+        assert_eq!(tests.len(), 2);
+        assert!(
+            tests
+                .iter()
+                .all(|t| matches!(t.cases_expansion, CasesExpansion::CannotExpand(_))),
+            "expected CannotExpand for fixture params, got: {:?}",
+            tests
+                .iter()
+                .map(|t| &t.cases_expansion)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_plain_fixture_still_expands_parametrize() {
+        let source = r#"
+import pytest
+
+class TestLoanExtract:
+    @pytest.fixture(autouse=True)
+    def _set_flag(self):
+        pass
+
+    @pytest.mark.parametrize("x", [1, 2])
+    def test_param(self, x):
+        pass
+"#;
+
+        let config = TestDiscoveryConfig::default();
+        let tests = discover_tests(&PathBuf::from("test.py"), source, &config).unwrap();
+        assert_eq!(tests.len(), 1);
+        if let CasesExpansion::Expanded(cases) = &tests[0].cases_expansion {
+            assert_eq!(cases.len(), 2);
+        } else {
+            panic!(
+                "plain @pytest.fixture should not block parametrize, got: {:?}",
+                tests[0].cases_expansion
+            );
+        }
+    }
+
+    #[test]
     fn test_stdlib_inheritance_graceful() {
         use std::fs;
         use tempfile::TempDir;
