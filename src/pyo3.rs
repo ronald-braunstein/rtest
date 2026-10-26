@@ -8,7 +8,8 @@ use std::path::PathBuf;
 
 use crate::cli::{exit_codes, Args, Runner};
 use crate::collection::error::CollectionError;
-use crate::config::read_pytest_config;
+use crate::config::{read_pytest_config, strict_parametrization_ids_possible};
+use crate::python_discovery::DuplicateIds;
 use crate::runner::PytestRunner;
 use crate::scheduler::DistributionMode;
 use crate::{
@@ -44,6 +45,30 @@ fn get_python_executable(py: Python) -> String {
         .unwrap_or_else(|_| "python3".to_string())
 }
 
+/// Pick the duplicate-ID rule for `version`, or for the pytest installed alongside rtest.
+fn duplicate_ids_for(
+    py: Python,
+    rootpath: &std::path::Path,
+    version: Option<&str>,
+) -> DuplicateIds {
+    let version = version.map(str::to_owned).or_else(|| {
+        py.import("importlib.metadata")
+            .and_then(|metadata| metadata.call_method1("version", ("pytest",)))
+            .and_then(|version| version.extract::<String>())
+            .ok()
+    });
+    let Some(major) = version
+        .as_deref()
+        .and_then(|version| version.split('.').next()?.parse::<u32>().ok())
+    else {
+        return DuplicateIds::RuntimeCollection;
+    };
+    DuplicateIds::for_pytest(
+        major,
+        major >= 9 && strict_parametrization_ids_possible(rootpath),
+    )
+}
+
 #[pyfunction]
 #[pyo3(signature = (pytest_args=None))]
 fn run_tests(py: Python, pytest_args: Option<Vec<String>>) -> i32 {
@@ -71,7 +96,13 @@ fn run_tests(py: Python, pytest_args: Option<Vec<String>>) -> i32 {
         },
     };
 
-    let test_nodes = match collect_and_display(&rootpath, &filtered_args, &mut std::io::sink()) {
+    let duplicate_ids = duplicate_ids_for(py, &rootpath, None);
+    let test_nodes = match collect_and_display(
+        &rootpath,
+        &filtered_args,
+        duplicate_ids,
+        &mut std::io::sink(),
+    ) {
         ControlFlow::Continue(nodes) => nodes,
         ControlFlow::Break(code) => return code,
     };
@@ -89,12 +120,14 @@ fn run_tests(py: Python, pytest_args: Option<Vec<String>>) -> i32 {
 fn collect_and_display(
     rootpath: &std::path::Path,
     paths: &[String],
+    duplicate_ids: DuplicateIds,
     report: &mut dyn std::io::Write,
 ) -> ControlFlow<i32, Vec<String>> {
-    let (test_nodes, errors) = match collect_tests_rust(rootpath.to_path_buf(), paths) {
-        Ok((nodes, errors)) => (nodes, errors),
-        Err(e) => handle_collection_error(e),
-    };
+    let (test_nodes, errors) =
+        match collect_tests_rust(rootpath.to_path_buf(), paths, duplicate_ids) {
+            Ok((nodes, errors)) => (nodes, errors),
+            Err(e) => handle_collection_error(e),
+        };
 
     display_collection_results(&test_nodes, &errors);
     if let Err(error) = errors.write_cannot_expand_report(report) {
@@ -115,12 +148,13 @@ fn collect_and_display(
     ControlFlow::Continue(test_nodes)
 }
 
-fn collect_cli_tests(rootpath: &std::path::Path, args: &Args) -> Vec<String> {
+fn collect_cli_tests(py: Python, rootpath: &std::path::Path, args: &Args) -> Vec<String> {
     let mut report = args.report_writer().unwrap_or_else(|error| {
         eprintln!("ERROR: cannot open cannot-expand report: {error}");
         std::process::exit(exit_codes::TESTS_FAILED);
     });
-    let test_nodes = match collect_and_display(rootpath, &args.files, &mut report) {
+    let duplicate_ids = duplicate_ids_for(py, rootpath, args.pytest_version.as_deref());
+    let test_nodes = match collect_and_display(rootpath, &args.files, duplicate_ids, &mut report) {
         ControlFlow::Continue(nodes) => nodes,
         ControlFlow::Break(code) => std::process::exit(code),
     };
@@ -155,7 +189,7 @@ fn main_cli_with_args(py: Python, argv: Vec<String>) {
 
     match args.runner {
         Runner::Native => {
-            collect_cli_tests(&rootpath, &args);
+            collect_cli_tests(py, &rootpath, &args);
 
             // Read pytest configuration for collection patterns
             let pytest_config = read_pytest_config(&rootpath);
@@ -188,7 +222,7 @@ fn main_cli_with_args(py: Python, argv: Vec<String>) {
             // Legacy pytest-based runner
             let runner = PytestRunner::new(python_executable, &args.env);
 
-            let test_nodes = collect_cli_tests(&rootpath, &args);
+            let test_nodes = collect_cli_tests(py, &rootpath, &args);
 
             let exit_code =
                 if worker_count == NonZeroUsize::MIN || args.dist == DistributionMode::No {

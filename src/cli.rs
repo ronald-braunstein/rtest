@@ -52,6 +52,10 @@ pub struct Args {
     #[arg(long, default_value = "stdout")]
     pub cannot_expand_report: String,
 
+    /// Pytest version whose duplicate parametrize IDs to reproduce (default: installed pytest)
+    #[arg(long, value_name = "VERSION")]
+    pub pytest_version: Option<String>,
+
     /// Test runner backend
     #[arg(long, value_enum, default_value = "pytest")]
     pub runner: Runner,

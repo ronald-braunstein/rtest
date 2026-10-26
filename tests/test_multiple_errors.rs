@@ -2,6 +2,7 @@
 
 use indoc::indoc;
 use rtest::collection_integration::collect_tests_rust;
+use rtest::python_discovery::DuplicateIds;
 use rtest::CollectionError;
 use std::fs;
 use tempfile::TempDir;
@@ -33,7 +34,7 @@ fn test_collection_multiple_syntax_errors() {
     "#};
     fs::write(project_path.join("test_valid.py"), valid_content).expect("Failed to write file");
 
-    let (test_nodes, errors) = collect_tests_rust(project_path, &[])
+    let (test_nodes, errors) = collect_tests_rust(project_path, &[], DuplicateIds::default())
         .expect("syntax errors are collected without discarding valid tests");
 
     assert_eq!(test_nodes.len(), 2, "Should find tests from valid file");

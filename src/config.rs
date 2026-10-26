@@ -68,6 +68,65 @@ pub fn read_pytest_config(root_path: &Path) -> PytestConfig {
     config
 }
 
+/// Whether pytest 9 configuration under `root_path` may turn duplicate parametrize IDs into
+/// collection errors (`strict_parametrization_ids`, falling back to `strict`).
+///
+/// `pyproject.toml` pytest tables are evaluated; other config files and `PYTEST_ADDOPTS` count
+/// when they mention `strict` at all, since collectors must not guess IDs pytest would reject.
+pub fn strict_parametrization_ids_possible(root_path: &Path) -> bool {
+    if std::env::var("PYTEST_ADDOPTS").is_ok_and(|opts| opts.contains("strict")) {
+        return true;
+    }
+    let mentions_strict = |name: &str| {
+        std::fs::read_to_string(root_path.join(name)).is_ok_and(|text| text.contains("strict"))
+    };
+    if [
+        "pytest.toml",
+        ".pytest.toml",
+        "pytest.ini",
+        "tox.ini",
+        "setup.cfg",
+    ]
+    .into_iter()
+    .any(mentions_strict)
+    {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(root_path.join("pyproject.toml")) else {
+        return false;
+    };
+    let Ok(toml_value) = toml::from_str::<Value>(&text) else {
+        return mentions_strict("pyproject.toml");
+    };
+    let pytest = toml_value.get("tool").and_then(|t| t.get("pytest"));
+    let ini_options = pytest.and_then(|p| p.get("ini_options"));
+    pytest.is_some_and(strict_ids_in_table) || ini_options.is_some_and(strict_ids_in_table)
+}
+
+fn strict_ids_in_table(table: &Value) -> bool {
+    let enabled = |key: &str| {
+        table.get(key).map(|value| match value {
+            Value::Boolean(enabled) => *enabled,
+            Value::String(text) => !matches!(
+                text.to_ascii_lowercase().as_str(),
+                "false" | "no" | "off" | "0"
+            ),
+            _ => true,
+        })
+    };
+    let addopts_strict = table.get("addopts").is_some_and(|addopts| match addopts {
+        Value::String(text) => text.contains("strict"),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| item.as_str().is_some_and(|text| text.contains("strict"))),
+        _ => false,
+    });
+    addopts_strict
+        || enabled("strict_parametrization_ids")
+            .or_else(|| enabled("strict"))
+            .unwrap_or(false)
+}
+
 /// Read a TOML array of strings under the given `key`, yielding an iterator of
 /// its string elements. Returns `None` when the key is absent or not an array.
 fn read_string_array<'a>(
@@ -86,6 +145,43 @@ mod tests {
     use indoc::indoc;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_strict_parametrization_ids_possible() {
+        let cases = [
+            ("pyproject.toml", "[tool.mypy]\nstrict = true\n", false),
+            (
+                "pyproject.toml",
+                "[tool.pytest.ini_options]\nstrict = \"true\"\n",
+                true,
+            ),
+            (
+                "pyproject.toml",
+                "[tool.pytest]\nstrict = true\nstrict_parametrization_ids = false\n",
+                false,
+            ),
+            (
+                "pyproject.toml",
+                "[tool.pytest.ini_options]\naddopts = \"-o strict=true\"\n",
+                true,
+            ),
+            (
+                "pytest.ini",
+                "[pytest]\nstrict_parametrization_ids = true\n",
+                true,
+            ),
+            ("pytest.ini", "[pytest]\naddopts = -ra\n", false),
+        ];
+        for (name, content, expected) in cases {
+            let temp_dir = TempDir::new().expect("temp dir");
+            fs::write(temp_dir.path().join(name), content).expect("write config");
+            assert_eq!(
+                strict_parametrization_ids_possible(temp_dir.path()),
+                expected,
+                "{content}"
+            );
+        }
+    }
 
     #[test]
     fn test_read_pytest_config_no_file() {

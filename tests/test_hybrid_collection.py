@@ -10,12 +10,23 @@ from test_helpers import create_test_project, extract_test_lines
 
 from test_utils import RtestResult, run_rtest
 
+ORACLE_PYTHON = os.environ.get("RTEST_PARITY_PYTHON", sys.executable)
+
+
+def oracle_pytest_version() -> str:
+    return subprocess.run(
+        [ORACLE_PYTHON, "-c", "import pytest; print(pytest.__version__)"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
 
 def pytest_collect(root: Path, files: list[str]) -> list[str]:
     """Use the installed pytest as the oracle, optionally testing another version."""
     result = subprocess.run(
         [
-            os.environ.get("RTEST_PARITY_PYTHON", sys.executable),
+            ORACLE_PYTHON,
             "-m",
             "pytest",
             "--collect-only",
@@ -65,16 +76,18 @@ def test_hybrid_collection_matches_pytest() -> None:
             def test_objects(value): pass
             @pytest.mark.parametrize("amount,when", [(Decimal("1.5"), date(2024, 1, 1)), (2, date(2024, 2, 1))])
             def test_constructor_rows(amount, when): pass
+            @pytest.mark.parametrize("value", [1, 1])
+            def test_numeric_duplicates(value): pass
+            @pytest.mark.parametrize("value", [True, False, False])
+            def test_bool_duplicates(value): pass
+            @pytest.mark.parametrize("x", [1, 2])
+            @pytest.mark.parametrize("y", ["a", "a"])
+            def test_stacked_duplicates(x, y): pass
         """,
         "test_duplicates.py": """
             import pytest
-            @pytest.mark.parametrize("value", [1, 1])
-            def test_numeric(value): pass
             @pytest.mark.parametrize("value", [1, 2, 3], ids=["a", "a", "a0"])
             def test_collision(value): pass
-            @pytest.mark.parametrize("x", [1, 2])
-            @pytest.mark.parametrize("y", ["a", "a"])
-            def test_stacked(x, y): pass
         """,
         "test_objects.py": """
             import pytest
@@ -139,14 +152,18 @@ def test_hybrid_collection_matches_pytest() -> None:
     with create_test_project({name: textwrap.dedent(source) for name, source in files.items()}) as root:
         test_files = [name for name in files if Path(name).name.startswith("test_")]
         report = root / "fallback.txt"
-        result = collect(root, "--cannot-expand-report", str(report), *test_files)
+        version = oracle_pytest_version()
+        args = ("--cannot-expand-report", str(report), "--pytest-version", version)
+        result = collect(root, *args, *test_files)
         assert result.returncode == 0, result.output
         assert "rtest-cannot-expand:" not in result.stdout
         reported = {
             normalize_nodeid(line.removeprefix("rtest-cannot-expand: ")) for line in report.read_text().splitlines()
         }
         fallback = {nodeid.split("::", 1)[0] for nodeid in reported}
-        assert fallback == set(test_files) - {"test_static.py"}
+        # Pytest 7 emits colliding duplicate IDs, which only runtime collection reproduces.
+        static_files = {"test_static.py"} | ({"test_duplicates.py"} if int(version.split(".")[0]) >= 8 else set())
+        assert fallback == set(test_files) - static_files
         collected = [normalize_nodeid(line) for line in extract_test_lines(result.output_lines)]
         assert reported == {nodeid for nodeid in collected if nodeid.split("::", 1)[0] in fallback}
         static = [nodeid for nodeid in collected if nodeid not in reported]
@@ -190,3 +207,41 @@ def test_cannot_expand_report_destinations_and_lifecycle() -> None:
         result = collect(root, "--cannot-expand-report", str(root / "missing" / "report.txt"), "test_dynamic.py")
         assert result.returncode != 0
         assert "cannot open cannot-expand report" in result.stderr
+
+
+def test_duplicate_ids_follow_pytest_version() -> None:
+    source = """
+        import pytest
+        @pytest.mark.parametrize("value", [1, 1])
+        def test_numeric(value): pass
+        @pytest.mark.parametrize("value", [1, 2, 3], ids=["a", "a", "a0"])
+        def test_collision(value): pass
+    """
+    pytest8_ids = [
+        "test_numeric[1_0]",
+        "test_numeric[1_1]",
+        "test_collision[a1]",
+        "test_collision[a2]",
+        "test_collision[a0]",
+    ]
+    cases = [
+        (("--pytest-version", "7.3.1"), {}, ["test_numeric[10]", "test_numeric[11]"], {"test_collision"}),
+        (("--pytest-version", "8"), {}, pytest8_ids, set()),
+        (("--pytest-version", "9.1.1"), {}, pytest8_ids, set()),
+        ((), {}, pytest8_ids, set()),
+        (
+            ("--pytest-version", "9"),
+            {"pytest.ini": "[pytest]\nstrict = true\n"},
+            [],
+            {"test_numeric", "test_collision"},
+        ),
+    ]
+    for args, config, expected_ids, fallback_tests in cases:
+        with create_test_project({"test_dups.py": textwrap.dedent(source), **config}) as root:
+            report = root / "fallback.txt"
+            result = collect(root, "--cannot-expand-report", str(report), *args, "test_dups.py")
+            assert result.returncode == 0, result.output
+            reported = {line.split("::", 1)[1] for line in report.read_text().splitlines()}
+            assert reported == fallback_tests, args
+            collected = [line.split("::", 1)[1] for line in extract_test_lines(result.output_lines)]
+            assert [test for test in collected if test not in reported] == expected_ids, args
