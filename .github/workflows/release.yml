@@ -108,7 +108,7 @@ jobs:
     needs: [build, sdist]
     environment:
       name: pypi
-      url: https://pypi.org/p/rtest
+      url: https://pypi.org/p/rtest-forked-constants
     permissions:
       id-token: write
     steps:
