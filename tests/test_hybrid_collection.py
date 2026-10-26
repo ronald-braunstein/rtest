@@ -55,6 +55,16 @@ def test_hybrid_collection_matches_pytest() -> None:
             def test_explicit_ids(value): pass
             @pytest.mark.parametrize("value", [pytest.param(helper(), id="caf\u00e9")])
             def test_escaped_id(value): pass
+            from dataclasses import dataclass
+            from datetime import date
+            from decimal import Decimal
+            @dataclass
+            class Row:
+                value: int
+            @pytest.mark.parametrize("value", [Row(1), Row(2)])
+            def test_objects(value): pass
+            @pytest.mark.parametrize("amount,when", [(Decimal("1.5"), date(2024, 1, 1)), (2, date(2024, 2, 1))])
+            def test_constructor_rows(amount, when): pass
         """,
         "test_duplicates.py": """
             import pytest
@@ -68,12 +78,6 @@ def test_hybrid_collection_matches_pytest() -> None:
         """,
         "test_objects.py": """
             import pytest
-            from dataclasses import dataclass
-            @dataclass
-            class Row:
-                value: int
-            @pytest.mark.parametrize("value", [Row(1), Row(2)])
-            def test_objects(value): pass
             @pytest.mark.parametrize("x,y", [(str(1), str(2))])
             def test_helper_calls(x, y): pass
             def make_row(): return (1, 2)

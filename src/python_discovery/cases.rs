@@ -537,8 +537,13 @@ fn extract_literal(
         {
             return extract_pytest_param(call, resolver, enclosing_class, id_style);
         }
+        // Constructors (`MyData(1)`, `date(2024, 1, 1)`) produce objects that pytest IDs as
+        // `argnameN`. Helper calls may return str/int/enum values, so they need runtime collection.
         Expr::Call(call) if id_style == ParamIdStyle::RuntimeValue => {
-            return Err(CannotExpandReason::FunctionCall(get_call_name(&call.func)));
+            if !is_constructor_call(&call.func) {
+                return Err(CannotExpandReason::FunctionCall(get_call_name(&call.func)));
+            }
+            LiteralValue::Opaque
         }
         // Comprehensions cannot be counted without evaluation
         Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::Generator(_) => {
@@ -600,6 +605,31 @@ fn id_for_resolved(resolved: &ResolvedConstant, id_style: ParamIdStyle) -> CaseI
     match id_style {
         ParamIdStyle::SourcePath => CaseId::Value(resolved.source_path.join(".")),
         ParamIdStyle::RuntimeValue => CaseId::from_literal(&resolved.value),
+    }
+}
+
+/// Stdlib datetime types are constructors but named in lowercase (`from datetime import date`).
+/// Pytest IDs those instances as `argnameN`, same as PascalCase classes.
+const DATETIME_CONSTRUCTOR_NAMES: &[&str] = &["date", "datetime", "timedelta", "time"];
+
+fn is_constructor_call(func: &Expr) -> bool {
+    match func {
+        Expr::Name(name) => {
+            let id = name.id.as_str();
+            DATETIME_CONSTRUCTOR_NAMES.contains(&id)
+                || id.chars().next().is_some_and(char::is_uppercase)
+        }
+        // `datetime.date(...)` / `dt.timedelta(...)` after `import datetime` or `import datetime as dt`.
+        // `time.time()` is the stdlib clock: pytest IDs the returned float.
+        Expr::Attribute(attr) => {
+            let attr_name = attr.attr.as_str();
+            DATETIME_CONSTRUCTOR_NAMES.contains(&attr_name)
+                && matches!(
+                    attr.value.as_ref(),
+                    Expr::Name(n) if !(n.id.as_str() == "time" && attr_name == "time")
+                )
+        }
+        _ => false,
     }
 }
 
