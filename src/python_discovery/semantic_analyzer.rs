@@ -126,8 +126,12 @@ impl SemanticTestDiscovery {
         for stmt in &ast_module.body {
             if let Stmt::FunctionDef(func) = stmt {
                 if self.config.is_test_function(func.name.as_str()) {
-                    let cases_expansion =
-                        parse_decorators_for_cases(&func.decorator_list, &resolver, None);
+                    let cases_expansion = parse_decorators_for_cases(
+                        &func.decorator_list,
+                        &resolver,
+                        None,
+                        self.config.duplicate_ids,
+                    );
                     all_tests.push(TestInfo {
                         name: func.name.to_string(),
                         class_name: None,
@@ -245,6 +249,7 @@ impl SemanticTestDiscovery {
                 &class_def.decorator_list,
                 resolver,
                 Some(class_def.name.as_str()),
+                self.config.duplicate_ids,
             ),
             base_classes: class_def
                 .bases()

@@ -30,8 +30,66 @@ pub enum LiteralValue {
 pub struct CasesSpec {
     /// Final case IDs, including any explicit overrides.
     pub ids: Vec<String>,
-    /// Pytest duplicate suffixes depend on its version and need runtime fallback.
+    /// Pytest IDs, already made unique per decorator; any duplicates left need runtime collection.
     pub pytest_unique_ids: bool,
+}
+
+/// How `@pytest.mark.parametrize` duplicate IDs are made unique; pytest 8 changed the rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DuplicateIds {
+    /// Pytest version unknown, or duplicates are a collection error: collect them with pytest.
+    #[default]
+    RuntimeCollection,
+    /// Pytest 7 appends a counter to every copy (`a0`, `a1`), even when that collides.
+    Pytest7,
+    /// Pytest 8+ adds `_` after a trailing digit (`1_0`) and skips counters that collide.
+    Pytest8,
+}
+
+impl DuplicateIds {
+    /// Choose the rule for an installed pytest version.
+    ///
+    /// Pytest 9 can reject duplicates (`strict_parametrization_ids`), so callers pass whether
+    /// the configuration may enable that.
+    pub fn for_pytest(major: u32, strict_ids_possible: bool) -> Self {
+        match major {
+            7 => Self::Pytest7,
+            8 => Self::Pytest8,
+            9.. if !strict_ids_possible => Self::Pytest8,
+            _ => Self::RuntimeCollection,
+        }
+    }
+
+    /// Make one parametrize call's IDs unique the way pytest does.
+    fn apply(self, ids: Vec<String>) -> Vec<String> {
+        let mut counts = std::collections::HashMap::<String, usize>::new();
+        for id in &ids {
+            *counts.entry(id.clone()).or_default() += 1;
+        }
+        if self == Self::RuntimeCollection || counts.values().all(|&count| count == 1) {
+            return ids;
+        }
+        let mut next_suffix = std::collections::HashMap::<String, usize>::new();
+        let mut resolved = ids.clone();
+        for (index, id) in ids.iter().enumerate() {
+            if counts[id] == 1 {
+                continue;
+            }
+            let separator = match self {
+                Self::Pytest8 if id.ends_with(|c: char| c.is_ascii_digit()) => "_",
+                _ => "",
+            };
+            let suffix = next_suffix.entry(id.clone()).or_default();
+            let mut unique = format!("{id}{separator}{suffix}");
+            while self == Self::Pytest8 && resolved.contains(&unique) {
+                *suffix += 1;
+                unique = format!("{id}{separator}{suffix}");
+            }
+            resolved[index] = unique;
+            *suffix += 1;
+        }
+        resolved
+    }
 }
 
 /// Parsed decorators cached for inheritance; an empty list means no cases decorators.
@@ -104,8 +162,9 @@ pub fn parse_decorators_for_cases(
     decorators: &[Decorator],
     resolver: &ConstantResolver,
     enclosing_class: Option<&str>,
+    duplicate_ids: DuplicateIds,
 ) -> CasesExpansion {
-    match parse_decorators_to_specs(decorators, resolver, enclosing_class) {
+    match parse_decorators_to_specs(decorators, resolver, enclosing_class, duplicate_ids) {
         Ok(specs) => expand_cases(specs.iter()),
         Err(reason) => CasesExpansion::CannotExpand(reason),
     }
@@ -119,6 +178,7 @@ pub fn parse_decorators_to_specs(
     decorators: &[Decorator],
     resolver: &ConstantResolver,
     enclosing_class: Option<&str>,
+    duplicate_ids: DuplicateIds,
 ) -> MethodCasesInfo {
     if resolver.has_runtime_parameters() {
         return Err(CannotExpandReason::UnsupportedExpression(
@@ -128,7 +188,7 @@ pub fn parse_decorators_to_specs(
     decorators
         .iter()
         .filter_map(|decorator| {
-            parse_single_decorator(decorator, resolver, enclosing_class).transpose()
+            parse_single_decorator(decorator, resolver, enclosing_class, duplicate_ids).transpose()
         })
         .collect()
 }
@@ -153,6 +213,7 @@ fn parse_single_decorator(
     decorator: &Decorator,
     resolver: &ConstantResolver,
     enclosing_class: Option<&str>,
+    duplicate_ids: DuplicateIds,
 ) -> Result<Option<CasesSpec>, CannotExpandReason> {
     let Expr::Call(call) = &decorator.expression else {
         return Ok(None);
@@ -220,9 +281,14 @@ fn parse_single_decorator(
                 .collect()
         }
     };
+    let pytest_unique_ids = id_style == ParamIdStyle::RuntimeValue;
     Ok(Some(CasesSpec {
-        ids,
-        pytest_unique_ids: id_style == ParamIdStyle::RuntimeValue,
+        ids: if pytest_unique_ids {
+            duplicate_ids.apply(ids)
+        } else {
+            ids
+        },
+        pytest_unique_ids,
     }))
 }
 
@@ -787,4 +853,47 @@ fn deduplicate_ids(ids: Vec<String>) -> Vec<String> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DuplicateIds;
+
+    fn apply(rule: DuplicateIds, ids: &[&str]) -> Vec<String> {
+        rule.apply(ids.iter().map(|id| (*id).to_string()).collect())
+    }
+
+    #[test]
+    fn test_duplicate_ids_match_pytest_versions() {
+        let cases: [(&[&str], &[&str], &[&str]); 4] = [
+            (
+                &["True", "False", "False"],
+                &["True", "False0", "False1"],
+                &["True", "False0", "False1"],
+            ),
+            (&["1", "1"], &["10", "11"], &["1_0", "1_1"]),
+            (&["a", "a", "a0"], &["a0", "a1", "a0"], &["a1", "a2", "a0"]),
+            (&["", ""], &["0", "1"], &["0", "1"]),
+        ];
+        for (ids, pytest7, pytest8) in cases {
+            assert_eq!(apply(DuplicateIds::Pytest7, ids), pytest7, "{ids:?}");
+            assert_eq!(apply(DuplicateIds::Pytest8, ids), pytest8, "{ids:?}");
+            assert_eq!(apply(DuplicateIds::RuntimeCollection, ids), ids, "{ids:?}");
+        }
+    }
+
+    #[test]
+    fn test_duplicate_ids_rule_for_pytest_version() {
+        assert_eq!(
+            DuplicateIds::for_pytest(6, false),
+            DuplicateIds::RuntimeCollection
+        );
+        assert_eq!(DuplicateIds::for_pytest(7, true), DuplicateIds::Pytest7);
+        assert_eq!(DuplicateIds::for_pytest(8, true), DuplicateIds::Pytest8);
+        assert_eq!(DuplicateIds::for_pytest(9, false), DuplicateIds::Pytest8);
+        assert_eq!(
+            DuplicateIds::for_pytest(9, true),
+            DuplicateIds::RuntimeCollection
+        );
+    }
 }

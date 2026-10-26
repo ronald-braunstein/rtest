@@ -3,7 +3,7 @@
 use crate::collection::error::{CollectionError, CollectionWarning};
 use crate::collection::nodes::Session;
 use crate::collection::types::CollectionNode;
-use crate::python_discovery::DiscoveryCache;
+use crate::python_discovery::{DiscoveryCache, DuplicateIds};
 #[cfg(feature = "extension-module")]
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -30,8 +30,10 @@ impl CollectionErrors {
 pub fn collect_tests_rust(
     rootpath: PathBuf,
     args: &[String],
+    duplicate_ids: DuplicateIds,
 ) -> Result<(Vec<String>, CollectionErrors), CollectionError> {
-    let session = Session::new(rootpath);
+    let mut session = Session::new(rootpath);
+    session.config.duplicate_ids = duplicate_ids;
     let mut collection_errors = CollectionErrors {
         errors: Vec::new(),
         warnings: Vec::new(),

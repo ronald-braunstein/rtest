@@ -175,6 +175,7 @@ impl CollectionBranch {
         let discovery_config = TestDiscoveryConfig {
             python_classes: session.config.python_classes.clone(),
             python_functions: session.config.python_functions.clone(),
+            duplicate_ids: session.config.duplicate_ids,
         };
 
         // Use the session's root path for module resolution

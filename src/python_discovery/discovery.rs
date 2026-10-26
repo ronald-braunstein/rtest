@@ -2,7 +2,7 @@
 
 use crate::collection::error::{CollectionError, CollectionResult, CollectionWarning};
 use crate::python_discovery::cases::{
-    parse_decorators_to_specs, CannotExpandReason, CasesExpansion,
+    parse_decorators_to_specs, CannotExpandReason, CasesExpansion, DuplicateIds,
 };
 use crate::python_discovery::constant_resolver::ConstantResolver;
 use crate::python_discovery::module_resolver::ModuleResolver;
@@ -56,6 +56,7 @@ pub(crate) fn require_pytest_collection(tests: &mut [TestInfo], reason: &str) {
 pub struct TestDiscoveryConfig {
     pub python_classes: Vec<String>,
     pub python_functions: Vec<String>,
+    pub duplicate_ids: DuplicateIds,
 }
 
 impl Default for TestDiscoveryConfig {
@@ -63,6 +64,7 @@ impl Default for TestDiscoveryConfig {
         Self {
             python_classes: vec!["Test*".into()],
             python_functions: vec!["test*".into()],
+            duplicate_ids: DuplicateIds::default(),
         }
     }
 }
@@ -107,6 +109,7 @@ pub(crate) fn collect_test_methods(
                         &func.decorator_list,
                         resolver,
                         Some(class.name.as_str()),
+                        config.duplicate_ids,
                     ),
                 })
             }
