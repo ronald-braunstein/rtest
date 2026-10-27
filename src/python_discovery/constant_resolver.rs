@@ -213,6 +213,8 @@ const STDLIB_OBJECT_TYPES: &[&str] = &[
 enum ElementView {
     Keys,
     Values,
+    /// `(key, value)` pairs of a mapping.
+    Items,
 }
 
 /// Builtins that produce containers; pytest IDs container values positionally.
@@ -515,6 +517,7 @@ fn pending_call(
         let view = match attr.attr.as_str() {
             "keys" => ElementView::Keys,
             "values" => ElementView::Values,
+            "items" => ElementView::Items,
             _ => return constructor_value(call, locals),
         };
         if !args.is_empty() {
@@ -586,6 +589,32 @@ const MAX_RANGE_LEN: usize = 10_000;
 
 /// `sorted()` for homogeneous strings or ints; other mixes need Python's comparison rules.
 fn sort_literals(items: &mut [LiteralValue]) -> Option<()> {
+    if items
+        .iter()
+        .all(|item| matches!(item, LiteralValue::Sequence(pair) if pair.len() == 2))
+    {
+        // `sorted(d.items())`: dict keys are unique, so tuple order is decided by the key alone.
+        let mut keys: Vec<LiteralValue> = items
+            .iter()
+            .map(|item| match item {
+                LiteralValue::Sequence(pair) => pair[0].clone(),
+                _ => LiteralValue::None,
+            })
+            .collect();
+        sort_literals(&mut keys)?;
+        if keys.windows(2).any(|w| w[0] == w[1]) {
+            return None;
+        }
+        let mut sorted = Vec::with_capacity(items.len());
+        for key in &keys {
+            let index = items
+                .iter()
+                .position(|item| matches!(item, LiteralValue::Sequence(pair) if pair[0] == *key))?;
+            sorted.push(items[index].clone());
+        }
+        items.clone_from_slice(&sorted);
+        return Some(());
+    }
     if items
         .iter()
         .all(|item| matches!(item, LiteralValue::String(_)))
@@ -1665,6 +1694,10 @@ impl ConstantResolver {
                     (LiteralValue::Mapping(entries), ElementView::Values) => entries
                         .into_iter()
                         .map(|(_, value)| value)
+                        .collect::<Option<_>>()?,
+                    (LiteralValue::Mapping(entries), ElementView::Items) => entries
+                        .into_iter()
+                        .map(|(key, value)| Some(LiteralValue::Sequence(vec![key, value?])))
                         .collect::<Option<_>>()?,
                     _ => return None,
                 };
