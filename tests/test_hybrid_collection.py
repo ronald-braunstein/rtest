@@ -196,11 +196,24 @@ def test_hybrid_collection_matches_pytest() -> None:
             )
             def test_allowlisted_calls(value): pass
             NAME = "n"
+            class Ids:
+                PREFIX = "id"
+                FLAG = False
             PAIRS = [("a", 1), ("b", 2)]
             LOOKUP = {"k": "v", Color.RED: "red"}
             @pytest.mark.parametrize(
                 "value",
-                [f"x-{ONE}-{NAME}", f"{NAME!s}" "-tail", PAIRS[-1][0], PAIRS[1], LOOKUP["k"], LOOKUP[Color.RED]],
+                [
+                    f"x-{ONE}-{NAME}",
+                    f"{Ids.PREFIX}:{Ids.FLAG}:{None}",
+                    f"{NAME!s}" "-tail",
+                    {1, 2},
+                    {"a": 1},
+                    PAIRS[-1][0],
+                    PAIRS[1],
+                    LOOKUP["k"],
+                    LOOKUP[Color.RED],
+                ],
             )
             def test_evaluated_expressions(value): pass
             class TestNested:
@@ -262,6 +275,8 @@ def test_hybrid_collection_matches_pytest() -> None:
                 ("fstring_format", "ONE = 1", '[f"{ONE:03}"]'),
                 ("fstring_repr", "NAME = 'n'", '[f"{NAME!r}"]'),
                 ("conditional", "ONE = 1", '["a" if ONE else "b"]'),
+                ("fstring_runtime", "import os", '[f"{os.sep}x"]'),
+                ("fstring_call", "def name(): return 'n'", '[f"{name()}"]'),
                 ("comparison", "ONE = 1", "[ONE == 1]"),
                 (
                     "value_return",

@@ -1719,6 +1719,10 @@ impl ConstantResolver {
                     match resolve(part)? {
                         LiteralValue::String(value) => text.push_str(&value),
                         LiteralValue::Int(value) => text.push_str(&value.to_string()),
+                        LiteralValue::Bool(value) => {
+                            text.push_str(if value { "True" } else { "False" })
+                        }
+                        LiteralValue::None => text.push_str("None"),
                         _ => return None,
                     }
                 }
