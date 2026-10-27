@@ -1521,12 +1521,12 @@ impl ConstantResolver {
             }
         } else if module.scope.children.contains_key(first) {
             return self.lookup_class_path(module_path, first, rest, depth);
-        } else if let Some(binding) = module.scope.bindings.get(first) {
-            let [attribute] = rest else {
-                return None;
-            };
-            let value = self.binding_value(module_path, binding, depth)?;
-            return attribute_value(&value, attribute).map(ResolvedValue::Literal);
+        } else if let (Some(binding), [attribute]) = (module.scope.bindings.get(first), rest) {
+            if let Some(record @ LiteralValue::Record(_)) =
+                self.binding_value(module_path, binding, depth)
+            {
+                return attribute_value(&record, attribute).map(ResolvedValue::Literal);
+            }
         }
 
         let Some(import) = module.imports.get(first) else {

@@ -759,9 +759,15 @@ def test_record_attribute_ids_match_pytest() -> None:
             class Computed:
                 def __init__(self, name):
                     self.label = name.upper()
+            class Status:
+                DONE = "done"
             @dataclass(frozen=True)
             class Child(Case):
                 extra: str = ""
+        """,
+        "reexport.py": """
+            from records import Status
+            Status = Status
         """,
         "test_static_records.py": """
             import pytest
@@ -789,6 +795,9 @@ def test_record_attribute_ids_match_pytest() -> None:
             def test_inline(case): pass
             @pytest.mark.parametrize("value", [FIRST.id, FIRST.value])
             def test_constant_attribute(value): pass
+            from reexport import Status
+            @pytest.mark.parametrize("value", [Status.DONE])
+            def test_alias_attribute(value): pass
         """,
         "test_runtime_records.py": """
             import pytest
