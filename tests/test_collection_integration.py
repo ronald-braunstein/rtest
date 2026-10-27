@@ -2171,7 +2171,7 @@ class TestCollectionIntegration(unittest.TestCase):
             self.assertIn("collected 1 item", result.output)
 
     def test_dynamic_parametrize_still_unexpanded(self) -> None:
-        """Function calls and comprehensions are not expanded."""
+        """Function calls and call-reassigned constants are not expanded; static comprehensions are."""
         files = {
             "other.py": "SHADOWED = [9]\n",
             "constants.py": textwrap.dedent("""
@@ -2219,7 +2219,9 @@ class TestCollectionIntegration(unittest.TestCase):
                 extract_test_lines(result.output_lines),
                 [
                     "test_dynamic.py::test_call",
-                    "test_dynamic.py::test_comp",
+                    "test_dynamic.py::test_comp[0]",
+                    "test_dynamic.py::test_comp[1]",
+                    "test_dynamic.py::test_comp[2]",
                     "test_dynamic.py::test_imported",
                     "test_dynamic.py::test_imported_colors",
                     "test_dynamic.py::test_shadowed",

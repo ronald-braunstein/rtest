@@ -84,6 +84,52 @@ def test_hybrid_collection_matches_pytest() -> None:
             @pytest.mark.parametrize("y", ["a", "a"])
             def test_stacked_duplicates(x, y): pass
         """,
+        "test_values.py": """
+            import enum
+            import pytest
+            class Color(enum.Enum):
+                RED = "r"
+                GREEN = "g"
+                BLUE = "b"
+            class Plain:
+                pass
+            class Holder:
+                class Nested:
+                    pass
+                NAMES = ("n1", "n2")
+            def helper(): return 1
+            def make_plain() -> Plain: return Plain()
+            MAPPING = {"b": 2, "a": 1}
+            BASE = ["x", "y"]
+            CASES = [pytest.param(1, id="one"), pytest.param(2, marks=pytest.mark.skip)]
+            ROWS = [pytest.param(3, 4, id="row"), pytest.param(5, 6)]
+            @pytest.mark.parametrize("value", [Plain, int, helper, Holder.Nested])
+            def test_named(value): pass
+            @pytest.mark.parametrize("key", MAPPING)
+            def test_mapping(key): pass
+            @pytest.mark.parametrize("key", sorted(MAPPING.keys()))
+            def test_sorted_keys(key): pass
+            @pytest.mark.parametrize("value", list(MAPPING.values()))
+            def test_values(value): pass
+            @pytest.mark.parametrize("value", BASE + ["z"] + list(Holder.NAMES[1:]))
+            def test_concat_and_slice(value): pass
+            @pytest.mark.parametrize("value", ["ab" * 2, 3 * "c"])
+            def test_repeat(value): pass
+            @pytest.mark.parametrize("value", range(1, 4))
+            def test_range(value): pass
+            COLORS = (Color.RED, Color.GREEN, Color.BLUE)
+            PAIRS = [("a", 1), ("b", 2), ("c", 3)]
+            @pytest.mark.parametrize("value", [name for name, _ in PAIRS if not name == "b"])
+            def test_comprehension(value): pass
+            @pytest.mark.parametrize("value", [c for c in COLORS if c in (Color.RED, Color.BLUE) and c != Color.RED])
+            def test_enum_filter(value): pass
+            @pytest.mark.parametrize("value", CASES)
+            def test_params(value): pass
+            @pytest.mark.parametrize("x,y", ROWS)
+            def test_param_rows(x, y): pass
+            @pytest.mark.parametrize("value", [{"a": 1}, (1, 2), make_plain()])
+            def test_positional(value): pass
+        """,
         "test_duplicates.py": """
             import pytest
             @pytest.mark.parametrize("value", [1, 2, 3], ids=["a", "a", "a0"])
@@ -107,6 +153,12 @@ def test_hybrid_collection_matches_pytest() -> None:
             def test_unpacked_without_ids(value): pass
             @pytest.mark.parametrize("value", [])
             def test_empty(value): pass
+            import enum
+            class Mode(enum.Enum):
+                A = 1
+                ALIAS = 1
+            @pytest.mark.parametrize("value", [m for m in Mode])
+            def test_enum_iteration(value): pass
         """,
         "test_fixture.py": """
             from pytest import fixture as fx, mark
@@ -162,7 +214,9 @@ def test_hybrid_collection_matches_pytest() -> None:
         }
         fallback = {nodeid.split("::", 1)[0] for nodeid in reported}
         # Pytest 7 emits colliding duplicate IDs, which only runtime collection reproduces.
-        static_files = {"test_static.py"} | ({"test_duplicates.py"} if int(version.split(".")[0]) >= 8 else set())
+        static_files = {"test_static.py", "test_values.py"} | (
+            {"test_duplicates.py"} if int(version.split(".")[0]) >= 8 else set()
+        )
         assert fallback == set(test_files) - static_files
         collected = [normalize_nodeid(line) for line in extract_test_lines(result.output_lines)]
         assert reported == {nodeid for nodeid in collected if nodeid.split("::", 1)[0] in fallback}
@@ -174,7 +228,10 @@ def test_hybrid_collection_matches_pytest() -> None:
 
 def test_cannot_expand_report_destinations_and_lifecycle() -> None:
     files = {
-        "test_dynamic.py": "import pytest\n@pytest.mark.parametrize('x', range(2))\ndef test_collected(x): pass\n",
+        "test_dynamic.py": (
+            "import pytest\ndef values(): return [0, 1]\n"
+            "@pytest.mark.parametrize('x', values())\ndef test_collected(x): pass\n"
+        ),
         "test_static.py": "def test_static(): pass\n",
         "test_empty.py": "",
         "test_bad.py": "def test_broken(\n",

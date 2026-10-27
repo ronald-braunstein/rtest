@@ -6,7 +6,9 @@
 use ruff_python_ast::name::UnqualifiedName;
 use ruff_python_ast::{Decorator, Expr, ExprList, ExprTuple, Keyword};
 
-use super::constant_resolver::{try_extract_literal, ConstantResolver, ResolvedConstant};
+use super::constant_resolver::{
+    try_extract_literal, ConstantResolver, LocalValues, ResolvedConstant,
+};
 
 /// A literal value that can be statically extracted from AST.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +25,15 @@ pub enum LiteralValue {
     Opaque,
     /// An enum member. Pytest IDs use `str(member)` → `Class.MEMBER`.
     EnumMember(String),
+    /// A class or function. Pytest IDs use its `__name__`.
+    Named(String),
+    /// A dict literal: keys in insertion order, values when they are statically known.
+    Mapping(Vec<(LiteralValue, Option<LiteralValue>)>),
+    /// `pytest.param(*values, id=...)` stored in a constant.
+    Param {
+        values: Vec<LiteralValue>,
+        id: Option<String>,
+    },
 }
 
 /// Specification for a single `@cases` or `@parametrize` decorator.
@@ -248,20 +259,21 @@ fn parse_single_decorator(
                     })
                 })
                 .map(<[Expr]>::len)
-                .or_else(
-                    || match resolver.resolve_in_class(enclosing_class, values)?.value {
-                        LiteralValue::Sequence(values) => values
-                            .iter()
-                            .all(|value| {
-                                parameters.accepts_row_size(match value {
+                .or_else(|| {
+                    let values = resolve_argvalues(values, resolver, enclosing_class)?;
+                    values
+                        .iter()
+                        .all(|value| {
+                            // A param's own id wins over `ids=`; leave that to pytest.
+                            !matches!(value, LiteralValue::Param { id: Some(_), .. })
+                                && parameters.accepts_row_size(match value {
                                     LiteralValue::Sequence(row) => Some(row.len()),
+                                    LiteralValue::Param { values, .. } => Some(values.len()),
                                     _ => None,
                                 })
-                            })
-                            .then_some(values.len()),
-                        _ => None,
-                    },
-                );
+                        })
+                        .then_some(values.len())
+                });
             if count != Some(ids.len()) {
                 return Err(CannotExpandReason::UnsupportedExpression(
                     "ids length must match a static case sequence".into(),
@@ -376,7 +388,9 @@ enum CaseId {
 impl CaseId {
     fn from_literal(value: &LiteralValue) -> Self {
         match value {
-            LiteralValue::Opaque => Self::Positional,
+            LiteralValue::Opaque | LiteralValue::Mapping(_) | LiteralValue::Param { .. } => {
+                Self::Positional
+            }
             LiteralValue::Sequence(values) => {
                 Self::Parts(values.iter().map(Self::from_literal).collect())
             }
@@ -424,12 +438,19 @@ fn extract_argvalues(
             .collect(),
         // A named sequence keeps source-path IDs for cases and value IDs for parametrize.
         Expr::Name(name) => {
-            let Some(ResolvedConstant {
-                value: LiteralValue::Sequence(values),
-                source_path,
-            }) = resolver.resolve_in_class(enclosing_class, expr)
-            else {
-                return Err(CannotExpandReason::VariableReference(name.id.to_string()));
+            let (values, source_path) = match resolver.resolve_in_class(enclosing_class, expr) {
+                Some(ResolvedConstant {
+                    value: LiteralValue::Sequence(values),
+                    source_path,
+                }) => (values, source_path),
+                Some(ResolvedConstant {
+                    value: LiteralValue::Mapping(entries),
+                    source_path,
+                }) if id_style == ParamIdStyle::RuntimeValue => (
+                    entries.into_iter().map(|(key, _)| key).collect(),
+                    source_path,
+                ),
+                _ => return Err(CannotExpandReason::VariableReference(name.id.to_string())),
             };
             Ok(match id_style {
                 ParamIdStyle::SourcePath => {
@@ -446,6 +467,24 @@ fn extract_argvalues(
                     .collect(),
             })
         }
+        _ if id_style == ParamIdStyle::RuntimeValue => {
+            let values =
+                resolve_argvalues(expr, resolver, enclosing_class).ok_or_else(|| match expr {
+                    Expr::Call(call) => CannotExpandReason::FunctionCall(get_call_name(&call.func)),
+                    Expr::ListComp(_)
+                    | Expr::SetComp(_)
+                    | Expr::DictComp(_)
+                    | Expr::Generator(_) => CannotExpandReason::Comprehension,
+                    _ => CannotExpandReason::UnsupportedExpression(
+                        "argvalues must be a list or tuple".to_string(),
+                    ),
+                })?;
+            Ok(values
+                .iter()
+                .enumerate()
+                .map(|(idx, v)| id_for_resolved_case_value(v, argnames, idx))
+                .collect())
+        }
         Expr::Call(call) => {
             let func_name = get_call_name(&call.func);
             Err(CannotExpandReason::FunctionCall(func_name))
@@ -456,6 +495,180 @@ fn extract_argvalues(
         _ => Err(CannotExpandReason::UnsupportedExpression(
             "argvalues must be a list or tuple".to_string(),
         )),
+    }
+}
+
+/// Most comprehension results a decorator may expand to.
+const MAX_COMPREHENSION_LEN: usize = 10_000;
+
+/// Statically evaluate a non-literal argvalues expression to its sequence of cases.
+fn resolve_argvalues(
+    expr: &Expr,
+    resolver: &ConstantResolver,
+    enclosing_class: Option<&str>,
+) -> Option<Vec<LiteralValue>> {
+    let value = match expr {
+        Expr::ListComp(comp) => {
+            eval_comprehension(&comp.elt, &comp.generators, resolver, enclosing_class)?
+        }
+        Expr::Generator(comp) => {
+            eval_comprehension(&comp.elt, &comp.generators, resolver, enclosing_class)?
+        }
+        _ => resolver.resolve_expr(enclosing_class, expr, &LocalValues::new())?,
+    };
+    match value {
+        LiteralValue::Sequence(values) => Some(values),
+        LiteralValue::Mapping(entries) => Some(entries.into_iter().map(|(key, _)| key).collect()),
+        _ => None,
+    }
+}
+
+fn eval_comprehension(
+    elt: &Expr,
+    generators: &[ruff_python_ast::Comprehension],
+    resolver: &ConstantResolver,
+    enclosing_class: Option<&str>,
+) -> Option<LiteralValue> {
+    let mut values = Vec::new();
+    eval_generators(
+        elt,
+        generators,
+        resolver,
+        enclosing_class,
+        &LocalValues::new(),
+        &mut values,
+    )?;
+    Some(LiteralValue::Sequence(values))
+}
+
+fn eval_generators(
+    elt: &Expr,
+    generators: &[ruff_python_ast::Comprehension],
+    resolver: &ConstantResolver,
+    enclosing_class: Option<&str>,
+    locals: &LocalValues,
+    values: &mut Vec<LiteralValue>,
+) -> Option<()> {
+    let Some((generator, rest)) = generators.split_first() else {
+        values.push(resolver.resolve_expr(enclosing_class, elt, locals)?);
+        return (values.len() <= MAX_COMPREHENSION_LEN).then_some(());
+    };
+    if generator.is_async {
+        return None;
+    }
+    let items = match resolver.resolve_expr(enclosing_class, &generator.iter, locals)? {
+        LiteralValue::Sequence(items) => items,
+        LiteralValue::Mapping(entries) => entries.into_iter().map(|(key, _)| key).collect(),
+        _ => return None,
+    };
+    for item in items {
+        let mut scope = locals.clone();
+        bind_target(&generator.target, item, &mut scope)?;
+        let mut keep = true;
+        for condition in &generator.ifs {
+            keep &= eval_condition(condition, resolver, enclosing_class, &scope)?;
+        }
+        if keep {
+            eval_generators(elt, rest, resolver, enclosing_class, &scope, values)?;
+        }
+    }
+    Some(())
+}
+
+fn bind_target(target: &Expr, value: LiteralValue, locals: &mut LocalValues) -> Option<()> {
+    match (target, value) {
+        (Expr::Name(name), value) => {
+            locals.insert(name.id.to_string(), value);
+            Some(())
+        }
+        (
+            Expr::Tuple(ExprTuple { elts, .. }) | Expr::List(ExprList { elts, .. }),
+            LiteralValue::Sequence(values),
+        ) if elts.len() == values.len() => elts
+            .iter()
+            .zip(values)
+            .try_for_each(|(target, value)| bind_target(target, value, locals)),
+        _ => None,
+    }
+}
+
+/// Evaluate a comprehension filter; `None` when Python's result cannot be known statically.
+fn eval_condition(
+    expr: &Expr,
+    resolver: &ConstantResolver,
+    enclosing_class: Option<&str>,
+    locals: &LocalValues,
+) -> Option<bool> {
+    use ruff_python_ast::{BoolOp, CmpOp, UnaryOp};
+    let resolve = |expr: &Expr| resolver.resolve_expr(enclosing_class, expr, locals);
+    match expr {
+        Expr::BoolOp(bool_op) => {
+            let results = bool_op
+                .values
+                .iter()
+                .map(|value| eval_condition(value, resolver, enclosing_class, locals))
+                .collect::<Option<Vec<_>>>()?;
+            Some(match bool_op.op {
+                BoolOp::And => results.iter().all(|r| *r),
+                BoolOp::Or => results.iter().any(|r| *r),
+            })
+        }
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+            eval_condition(&unary.operand, resolver, enclosing_class, locals).map(|r| !r)
+        }
+        Expr::Compare(compare) => {
+            let ([op], [left, right]) = (compare.ops.as_ref(), compare.operands.as_ref()) else {
+                return None;
+            };
+            let (left, right) = (resolve(left)?, resolve(right)?);
+            match op {
+                CmpOp::Eq => literals_equal(&left, &right),
+                CmpOp::NotEq => literals_equal(&left, &right).map(|r| !r),
+                CmpOp::In | CmpOp::NotIn => {
+                    let items = match right {
+                        LiteralValue::Sequence(items) => items,
+                        LiteralValue::Mapping(entries) => {
+                            entries.into_iter().map(|(key, _)| key).collect()
+                        }
+                        _ => return None,
+                    };
+                    let mut found = false;
+                    for item in &items {
+                        found |= literals_equal(&left, item)?;
+                    }
+                    Some(found == (*op == CmpOp::In))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Python `==` for statically known values; `None` where numeric or enum coercion could apply.
+fn literals_equal(left: &LiteralValue, right: &LiteralValue) -> Option<bool> {
+    use LiteralValue as V;
+    match (left, right) {
+        (V::String(a), V::String(b)) => Some(a == b),
+        (V::Int(a), V::Int(b)) => Some(a == b),
+        (V::Bool(a), V::Bool(b)) => Some(a == b),
+        (V::None, V::None) => Some(true),
+        (V::Named(a), V::Named(b)) => Some(a == b),
+        (V::EnumMember(a), V::EnumMember(b)) => Some(a == b),
+        (V::Sequence(a), V::Sequence(b)) => {
+            if a.len() != b.len() {
+                return Some(false);
+            }
+            let mut equal = true;
+            for (a, b) in a.iter().zip(b) {
+                equal &= literals_equal(a, b)?;
+            }
+            Some(equal)
+        }
+        (V::Opaque | V::Mapping(_) | V::Param { .. } | V::EnumMember(_) | V::Float(_), _)
+        | (_, V::Opaque | V::Mapping(_) | V::Param { .. } | V::EnumMember(_) | V::Float(_))
+        | (V::Int(_) | V::Bool(_), V::Int(_) | V::Bool(_)) => None,
+        _ => Some(false),
     }
 }
 
@@ -481,14 +694,41 @@ fn extract_pytest_case(
     Ok(id.render(argnames, idx, 0))
 }
 
-fn eval_literal_binop(
+/// Largest string or sequence built by `*` repetition; larger results need runtime collection.
+const MAX_REPEATED_LEN: usize = 100_000;
+
+pub(crate) fn eval_literal_binop(
     op: ruff_python_ast::Operator,
     left: &LiteralValue,
     right: &LiteralValue,
 ) -> Option<LiteralValue> {
     use ruff_python_ast::Operator;
-    if let (LiteralValue::String(a), LiteralValue::String(b), Operator::Add) = (left, right, op) {
-        return Some(LiteralValue::String(format!("{a}{b}")));
+    match (left, right, op) {
+        (LiteralValue::String(a), LiteralValue::String(b), Operator::Add) => {
+            return Some(LiteralValue::String(format!("{a}{b}")));
+        }
+        (LiteralValue::Sequence(a), LiteralValue::Sequence(b), Operator::Add) => {
+            return Some(LiteralValue::Sequence([a.as_slice(), b].concat()));
+        }
+        (LiteralValue::String(s), LiteralValue::Int(n), Operator::Mult)
+        | (LiteralValue::Int(n), LiteralValue::String(s), Operator::Mult) => {
+            let count = usize::try_from(*n).unwrap_or(0);
+            return (s.len().saturating_mul(count) <= MAX_REPEATED_LEN)
+                .then(|| LiteralValue::String(s.repeat(count)));
+        }
+        (LiteralValue::Sequence(items), LiteralValue::Int(n), Operator::Mult)
+        | (LiteralValue::Int(n), LiteralValue::Sequence(items), Operator::Mult) => {
+            let count = usize::try_from(*n).unwrap_or(0);
+            return (items.len().saturating_mul(count) <= MAX_REPEATED_LEN).then(|| {
+                LiteralValue::Sequence(
+                    std::iter::repeat_n(items, count)
+                        .flatten()
+                        .cloned()
+                        .collect(),
+                )
+            });
+        }
+        _ => {}
     }
     let (LiteralValue::Int(l), LiteralValue::Int(r)) = (left, right) else {
         return None;
@@ -520,6 +760,18 @@ fn id_for_resolved_case_value(
     argnames: &CaseParameters,
     idx: usize,
 ) -> String {
+    let row;
+    let value = match value {
+        LiteralValue::Param { id: Some(id), .. } => return ascii_escape_string(id),
+        LiteralValue::Param { values, id: None } => match values.as_slice() {
+            [single] => single,
+            values => {
+                row = LiteralValue::Sequence(values.to_vec());
+                &row
+            }
+        },
+        value => value,
+    };
     let parts = match value {
         LiteralValue::Sequence(parts) if argnames.unpack_rows => parts.as_slice(),
         _ => std::slice::from_ref(value),
@@ -528,9 +780,10 @@ fn id_for_resolved_case_value(
         .iter()
         .enumerate()
         .map(|(i, part)| match part {
-            LiteralValue::Sequence(_) | LiteralValue::Opaque => {
-                format!("{}{}", argnames.name(i), idx)
-            }
+            LiteralValue::Sequence(_)
+            | LiteralValue::Opaque
+            | LiteralValue::Mapping(_)
+            | LiteralValue::Param { .. } => format!("{}{}", argnames.name(i), idx),
             _ => literal_to_id_string(part),
         })
         .collect::<Vec<_>>()
@@ -555,6 +808,52 @@ fn extract_literal(
         | Expr::NoneLiteral(_) => try_extract_literal(expr).ok_or_else(|| {
             CannotExpandReason::UnsupportedExpression("non-literal scalar".into())
         })?,
+        Expr::BinOp(_) | Expr::Call(_) | Expr::Subscript(_)
+            if id_style == ParamIdStyle::RuntimeValue
+                && resolver
+                    .imported_expression_name(call_func(expr))
+                    .as_deref()
+                    != Some("pytest.param") =>
+        {
+            if let Some(value) = resolver.resolve_expr(enclosing_class, expr, &LocalValues::new()) {
+                return Ok(element_value(value));
+            }
+            return extract_unresolved_literal(expr, resolver, enclosing_class, id_style);
+        }
+        _ => return extract_unresolved_literal(expr, resolver, enclosing_class, id_style),
+    };
+    let id = CaseId::from_literal(&literal);
+    Ok((literal, id))
+}
+
+/// The callee of a call expression, or the expression itself.
+fn call_func(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Call(call) => &call.func,
+        _ => expr,
+    }
+}
+
+/// A single parametrize value: pytest IDs list, tuple, and dict objects positionally.
+fn element_value(value: LiteralValue) -> (LiteralValue, CaseId) {
+    match value {
+        LiteralValue::Sequence(_) | LiteralValue::Mapping(_) | LiteralValue::Param { .. } => {
+            (LiteralValue::Opaque, CaseId::Positional)
+        }
+        value => {
+            let id = CaseId::from_literal(&value);
+            (value, id)
+        }
+    }
+}
+
+fn extract_unresolved_literal(
+    expr: &Expr,
+    resolver: &ConstantResolver,
+    enclosing_class: Option<&str>,
+    id_style: ParamIdStyle,
+) -> Result<(LiteralValue, CaseId), CannotExpandReason> {
+    let literal = match expr {
         Expr::BinOp(binop) => {
             let (left, _) = extract_literal(&binop.left, resolver, enclosing_class, id_style)?;
             let (right, _) = extract_literal(&binop.right, resolver, enclosing_class, id_style)?;
@@ -678,7 +977,7 @@ fn id_for_resolved(resolved: &ResolvedConstant, id_style: ParamIdStyle) -> CaseI
 /// Pytest IDs those instances as `argnameN`, same as PascalCase classes.
 const DATETIME_CONSTRUCTOR_NAMES: &[&str] = &["date", "datetime", "timedelta", "time"];
 
-fn is_constructor_call(func: &Expr) -> bool {
+pub(crate) fn is_constructor_call(func: &Expr) -> bool {
     match func {
         Expr::Name(name) => {
             let id = name.id.as_str();
@@ -733,7 +1032,12 @@ fn extract_ids_kwarg(
     };
     ids.iter()
         .map(|id| match id {
-            LiteralValue::None | LiteralValue::Sequence(_) | LiteralValue::Opaque => Err(invalid()),
+            LiteralValue::None
+            | LiteralValue::Sequence(_)
+            | LiteralValue::Opaque
+            | LiteralValue::Mapping(_)
+            | LiteralValue::Param { .. }
+            | LiteralValue::Named(_) => Err(invalid()),
             _ => Ok(literal_to_id_string(id)),
         })
         .collect::<Result<Vec<_>, _>>()
@@ -753,8 +1057,10 @@ pub fn literal_to_id_string(value: &LiteralValue) -> String {
             parts.join("-")
         }
         // Opaque values get positional IDs assigned in extract_argvalues
-        LiteralValue::Opaque => String::new(),
-        LiteralValue::EnumMember(id) => id.clone(),
+        LiteralValue::Opaque | LiteralValue::Mapping(_) | LiteralValue::Param { .. } => {
+            String::new()
+        }
+        LiteralValue::EnumMember(id) | LiteralValue::Named(id) => id.clone(),
     }
 }
 
