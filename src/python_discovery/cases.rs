@@ -35,6 +35,9 @@ pub enum LiteralValue {
         values: Vec<LiteralValue>,
         id: Option<String>,
     },
+    /// An instance of a plain record class (see the resolver's record shapes) with the
+    /// attributes its constructor sets, when known. Pytest IDs it positionally.
+    Record(Vec<(String, Option<LiteralValue>)>),
 }
 
 /// Specification for a single `@cases` or `@parametrize` decorator.
@@ -275,6 +278,20 @@ fn parse_single_decorator(
     };
 
     let parameters = extract_argnames(argnames)?;
+
+    let ids_lambda = call
+        .arguments
+        .keywords
+        .iter()
+        .find(|kw| kw.arg.as_deref() == Some("ids"))
+        .and_then(|kw| kw.value.as_lambda_expr());
+    if let (ParamIdStyle::RuntimeValue, Some(lambda)) = (id_style, ids_lambda) {
+        let ids = lambda_ids(lambda, values, &parameters, resolver, enclosing_class)?;
+        return Ok(Some(CasesSpec {
+            ids: duplicate_ids.apply(ids),
+            pytest_unique_ids: true,
+        }));
+    }
 
     let ids = match (
         id_style,
@@ -541,9 +558,10 @@ enum CaseId {
 impl CaseId {
     fn from_literal(value: &LiteralValue) -> Self {
         match value {
-            LiteralValue::Opaque | LiteralValue::Mapping(_) | LiteralValue::Param { .. } => {
-                Self::Positional
-            }
+            LiteralValue::Opaque
+            | LiteralValue::Mapping(_)
+            | LiteralValue::Param { .. }
+            | LiteralValue::Record(_) => Self::Positional,
             LiteralValue::Sequence(values) => {
                 Self::Parts(values.iter().map(Self::from_literal).collect())
             }
@@ -578,17 +596,21 @@ fn extract_argvalues(
     id_style: ParamIdStyle,
 ) -> Result<Vec<String>, CannotExpandReason> {
     match expr {
-        Expr::List(ExprList { elts, .. }) | Expr::Tuple(ExprTuple { elts, .. }) => elts
-            .iter()
-            .enumerate()
-            .map(|(idx, elt)| {
-                if id_style == ParamIdStyle::RuntimeValue {
-                    return extract_pytest_case(elt, argnames, idx, resolver, enclosing_class);
-                }
-                let (_, id) = extract_literal(elt, resolver, enclosing_class, id_style)?;
-                Ok(id.render(argnames, idx, 0))
-            })
-            .collect(),
+        Expr::List(ExprList { elts, .. }) | Expr::Tuple(ExprTuple { elts, .. })
+            if id_style != ParamIdStyle::RuntimeValue
+                || !elts.iter().any(Expr::is_starred_expr) =>
+        {
+            elts.iter()
+                .enumerate()
+                .map(|(idx, elt)| {
+                    if id_style == ParamIdStyle::RuntimeValue {
+                        return extract_pytest_case(elt, argnames, idx, resolver, enclosing_class);
+                    }
+                    let (_, id) = extract_literal(elt, resolver, enclosing_class, id_style)?;
+                    Ok(id.render(argnames, idx, 0))
+                })
+                .collect()
+        }
         // A named sequence keeps source-path IDs for cases and value IDs for parametrize.
         Expr::Name(name) => {
             let (values, source_path) = match resolver.resolve_in_class(enclosing_class, expr) {
@@ -936,7 +958,8 @@ fn id_for_resolved_case_value(
             LiteralValue::Sequence(_)
             | LiteralValue::Opaque
             | LiteralValue::Mapping(_)
-            | LiteralValue::Param { .. } => format!("{}{}", argnames.name(i), idx),
+            | LiteralValue::Param { .. }
+            | LiteralValue::Record(_) => format!("{}{}", argnames.name(i), idx),
             _ => literal_to_id_string(part),
         })
         .collect::<Vec<_>>()
@@ -1170,6 +1193,66 @@ fn get_call_name(func: &Expr) -> String {
 }
 
 /// Extract the `ids` keyword argument if present.
+/// IDs from `ids=lambda value: <expr>` for a single argname. Pytest calls the function on
+/// each value (a param's own `id` wins) and IDs the result like a value; `None` keeps the
+/// default ID, which is only reproduced here when it is positional.
+fn lambda_ids(
+    lambda: &ruff_python_ast::ExprLambda,
+    values: &Expr,
+    parameters: &CaseParameters,
+    resolver: &ConstantResolver,
+    enclosing_class: Option<&str>,
+) -> Result<Vec<String>, CannotExpandReason> {
+    let invalid = || {
+        CannotExpandReason::UnsupportedExpression(
+            "ids= callable must map each static value to a scalar ID".into(),
+        )
+    };
+    let parameter = lambda
+        .parameters
+        .as_deref()
+        .and_then(|params| match (params.args.as_slice(), params.len()) {
+            ([single], 1) if single.default.is_none() => Some(single.parameter.name.to_string()),
+            _ => None,
+        })
+        .ok_or_else(invalid)?;
+    if parameters.unpack_rows || parameters.names.len() != 1 {
+        return Err(invalid());
+    }
+    let values = resolve_argvalues(values, resolver, enclosing_class).ok_or_else(invalid)?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            let value = match value {
+                LiteralValue::Param { id: Some(id), .. } => return Ok(ascii_escape_string(id)),
+                LiteralValue::Param { values, id: None } => match values.as_slice() {
+                    [single] => single,
+                    _ => return Err(invalid()),
+                },
+                value => value,
+            };
+            let locals = LocalValues::from([(parameter.clone(), value.clone())]);
+            match resolver.resolve_expr(enclosing_class, &lambda.body, &locals) {
+                Some(LiteralValue::None)
+                    if matches!(CaseId::from_literal(value), CaseId::Positional) =>
+                {
+                    Ok(format!("{}{idx}", parameters.name(0)))
+                }
+                Some(
+                    id @ (LiteralValue::String(_)
+                    | LiteralValue::Int(_)
+                    | LiteralValue::Float(_)
+                    | LiteralValue::Bool(_)
+                    | LiteralValue::EnumMember(_)
+                    | LiteralValue::Named(_)),
+                ) => Ok(literal_to_id_string(&id)),
+                _ => Err(invalid()),
+            }
+        })
+        .collect()
+}
+
 fn extract_ids_kwarg(
     keywords: &[Keyword],
     resolver: &ConstantResolver,
@@ -1186,11 +1269,16 @@ fn extract_ids_kwarg(
             "ids= requires a static sequence of non-null scalar IDs".into(),
         )
     };
-    let value = try_extract_literal(&kw.value).or_else(|| {
-        resolver
-            .resolve_in_class(enclosing_class, &kw.value)
-            .map(|resolved| resolved.value)
-    });
+    let value = match &kw.value {
+        Expr::ListComp(comp) => {
+            eval_comprehension(&comp.elt, &comp.generators, resolver, enclosing_class)
+        }
+        value => try_extract_literal(value).or_else(|| {
+            resolver
+                .resolve_in_class(enclosing_class, value)
+                .map(|resolved| resolved.value)
+        }),
+    };
     let Some(LiteralValue::Sequence(ids)) = value else {
         return Err(invalid());
     };
@@ -1201,6 +1289,7 @@ fn extract_ids_kwarg(
             | LiteralValue::Opaque
             | LiteralValue::Mapping(_)
             | LiteralValue::Param { .. }
+            | LiteralValue::Record(_)
             | LiteralValue::Named(_) => Err(invalid()),
             _ => Ok(literal_to_id_string(id)),
         })
@@ -1221,9 +1310,10 @@ pub fn literal_to_id_string(value: &LiteralValue) -> String {
             parts.join("-")
         }
         // Opaque values get positional IDs assigned in extract_argvalues
-        LiteralValue::Opaque | LiteralValue::Mapping(_) | LiteralValue::Param { .. } => {
-            String::new()
-        }
+        LiteralValue::Opaque
+        | LiteralValue::Mapping(_)
+        | LiteralValue::Param { .. }
+        | LiteralValue::Record(_) => String::new(),
         LiteralValue::EnumMember(id) | LiteralValue::Named(id) => id.clone(),
     }
 }

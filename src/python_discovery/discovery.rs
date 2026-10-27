@@ -58,6 +58,9 @@ pub struct TestDiscoveryConfig {
     pub python_functions: Vec<String>,
     pub duplicate_ids: DuplicateIds,
     pub parametrize_wrappers: Vec<ParametrizeWrapper>,
+    /// Qualified functions that return a `Literal` type's values like `typing.get_args`,
+    /// also flattening unions of `Literal` types.
+    pub literal_values_functions: Vec<String>,
 }
 
 impl Default for TestDiscoveryConfig {
@@ -67,6 +70,7 @@ impl Default for TestDiscoveryConfig {
             python_functions: vec!["test*".into()],
             duplicate_ids: DuplicateIds::default(),
             parametrize_wrappers: Vec::new(),
+            literal_values_functions: Vec::new(),
         }
     }
 }

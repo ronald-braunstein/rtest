@@ -148,6 +148,29 @@ The wrapper is called as `@parametrize(argnames, argvalues, ids=None)` and passe
 `argnames`. IDs come from a static `ids=` list, then from `id-field` when the argnames include it, and otherwise
 default to `{argname}{index}`. Anything that cannot be resolved statically falls back to pytest, as above.
 
+#### Literal-values helpers
+
+Functions that return the values of a `Literal` type, like `typing.get_args`, can be listed by qualified name.
+Calls with one argument then expand from the type, with unions (`A | B` or `Union[A, B]`) flattened left to right:
+
+```toml
+[tool.rtest]
+literal-values-functions = ["myproject.literals.LiteralTools.values"]
+```
+
+Both `LiteralTools.values(Color)` and `LiteralTools[Color].values(Color)` resolve. Each `Literal` keeps its own
+de-duplication and union members that are equal as types are dropped, matching `typing.get_args`; a union member
+that is not a `Literal` of strings falls back to pytest.
+
+#### Records and IDs
+
+Instances of plain record classes are counted statically and IDed positionally, and their attributes can feed IDs
+(`ids=lambda case: case.name` or `ids=[case.name for case in CASES]`). A record class is a `@dataclass` without
+`__init__`, `__post_init__` or base classes, a `NamedTuple`, or a class whose `__init__` only assigns parameters to
+`self` attributes. Names reached through `from module import *` follow a static `__all__` (or the module's public
+names when it has none), and nested classes resolve members through dotted bases such as
+`class Status(Enums.Status): pass`.
+
 ### Path Separator Handling
 
 `rtest` uses platform-specific path separators in test nodeids, while `pytest` normalizes all paths to use forward
