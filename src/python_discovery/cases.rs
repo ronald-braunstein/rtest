@@ -808,7 +808,7 @@ fn extract_literal(
         | Expr::NoneLiteral(_) => try_extract_literal(expr).ok_or_else(|| {
             CannotExpandReason::UnsupportedExpression("non-literal scalar".into())
         })?,
-        Expr::BinOp(_) | Expr::Call(_) | Expr::Subscript(_)
+        Expr::BinOp(_) | Expr::Call(_) | Expr::Subscript(_) | Expr::FString(_)
             if id_style == ParamIdStyle::RuntimeValue
                 && resolver
                     .imported_expression_name(call_func(expr))
@@ -914,7 +914,15 @@ fn extract_unresolved_literal(
         Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::Generator(_) => {
             return Err(CannotExpandReason::Comprehension);
         }
-        // Dicts, sets, source-path calls, and other countable expressions are opaque.
+        // Dicts and sets are IDed positionally; other expressions may evaluate to values
+        // pytest IDs by value.
+        Expr::Dict(_) | Expr::Set(_) => LiteralValue::Opaque,
+        _ if id_style == ParamIdStyle::RuntimeValue => {
+            return Err(CannotExpandReason::UnsupportedExpression(
+                "expression evaluated at runtime".into(),
+            ))
+        }
+        // Source-path IDs only need a count.
         _ => LiteralValue::Opaque,
     };
     let id = CaseId::from_literal(&literal);

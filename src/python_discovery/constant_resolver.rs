@@ -34,6 +34,13 @@ struct ConstantScope {
     functions: std::collections::HashSet<String>,
     /// Return annotations of functions whose decorators keep the annotated return type.
     returns: HashMap<String, Expr>,
+    /// Every function defined in this scope, whatever its decorators.
+    defined_functions: std::collections::HashSet<String>,
+    /// Assigned expressions that may be type aliases (`X = Literal[...]`); `None` when reassigned.
+    aliases: HashMap<String, Option<Expr>>,
+    /// For a class scope: instances may not be plain objects (`__new__`, a metaclass,
+    /// attribute hooks, an own `__name__`, or a decorator that may replace the class).
+    custom_construction: bool,
     /// Runtime fixture parametrization cannot be represented by decorator-only IDs.
     runtime_parameters: bool,
 }
@@ -88,8 +95,56 @@ enum PendingValue {
         start: Option<i64>,
         stop: Option<i64>,
     },
-    /// A call whose result is IDed positionally when its return annotation is an object type.
+    /// `seq[i]` or `mapping[key]`.
+    Index {
+        source: Box<PendingValue>,
+        key: Box<PendingValue>,
+    },
+    /// An f-string whose interpolations use `str()` without a format spec.
+    FString(Vec<PendingValue>),
+    /// A call whose result is IDed positionally when it constructs an object or its
+    /// return annotation is an object type.
     CallResult(Vec<String>),
+    /// `get_args(X)`: the values of a `Literal[...]` type when the callee is `typing.get_args`.
+    LiteralArgs {
+        callee: Vec<String>,
+        argument: Box<Expr>,
+    },
+}
+
+/// Imported callables known to return objects that pytest IDs positionally.
+///
+/// Matched by fully qualified import name, so a local function with the same name is not affected.
+const OBJECT_RETURNING_CALLABLES: &[&str] = &[
+    "contextlib.nullcontext",
+    "dataclasses.replace",
+    "datetime.timezone",
+    "dateutil.relativedelta.relativedelta",
+    "pyarrow.array",
+    "pytest.raises",
+    "uuid.UUID",
+];
+
+const GET_ARGS_CALLABLES: &[&str] = &["typing.get_args", "typing_extensions.get_args"];
+const LITERAL_TYPES: &[&str] = &["typing.Literal", "typing_extensions.Literal"];
+
+/// Class decorators that return the decorated class itself.
+const TRANSPARENT_CLASS_DECORATORS: &[&str] = &["dataclass", "final", "total_ordering"];
+
+/// Class members that change how instances are created or which `__name__` they expose.
+const CUSTOM_CONSTRUCTION_MEMBERS: &[&str] =
+    &["__new__", "__getattr__", "__getattribute__", "__name__"];
+
+/// A callee reached by following module names and imports.
+#[derive(Debug, Clone, PartialEq)]
+enum Callee {
+    /// A class defined in a parsed module, by its path inside that module.
+    Class {
+        module: Vec<String>,
+        path: Vec<String>,
+    },
+    /// A name from a module that is not parsed (stdlib or third-party), fully qualified.
+    External(String),
 }
 
 /// Return annotations that may produce values pytest IDs by value or `__name__`.
@@ -349,9 +404,53 @@ fn pending_value(expr: &Expr, names: &ModuleNames, locals: &LocalValues) -> Opti
             binop.op,
             Box::new(pending_value(&binop.right, names, locals)?),
         )),
+        Expr::FString(fstring) => {
+            let mut parts = Vec::new();
+            for part in fstring.value.iter() {
+                match part {
+                    ruff_python_ast::FStringPartRef::Literal(literal) => parts.push(
+                        PendingValue::Literal(LiteralValue::String(literal.value.to_string())),
+                    ),
+                    ruff_python_ast::FStringPartRef::FString(fstring) => {
+                        for element in fstring.elements.iter() {
+                            match element {
+                                ruff_python_ast::InterpolatedStringElement::Literal(literal) => {
+                                    parts.push(PendingValue::Literal(LiteralValue::String(
+                                        literal.value.to_string(),
+                                    )))
+                                }
+                                ruff_python_ast::InterpolatedStringElement::Interpolation(
+                                    interpolation,
+                                ) => {
+                                    if interpolation.debug_text.is_some()
+                                        || interpolation.format_spec.is_some()
+                                        || !matches!(
+                                            interpolation.conversion,
+                                            ruff_python_ast::ConversionFlag::None
+                                                | ruff_python_ast::ConversionFlag::Str
+                                        )
+                                    {
+                                        return None;
+                                    }
+                                    parts.push(pending_value(
+                                        &interpolation.expression,
+                                        names,
+                                        locals,
+                                    )?);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some(PendingValue::FString(parts))
+        }
         Expr::Subscript(subscript) => {
             let Expr::Slice(slice) = subscript.slice.as_ref() else {
-                return None;
+                return Some(PendingValue::Index {
+                    source: Box::new(pending_value(&subscript.value, names, locals)?),
+                    key: Box::new(pending_value(&subscript.slice, names, locals)?),
+                });
             };
             if slice.step.is_some() {
                 return None;
@@ -397,6 +496,20 @@ fn pending_call(
                 .collect::<Option<_>>()?,
             id,
         });
+    }
+    if let (Some(callee), [argument], true) = (
+        UnqualifiedName::from_expr(&call.func),
+        args.args.as_ref(),
+        args.keywords.is_empty(),
+    ) {
+        if callee.segments().last() == Some(&"get_args")
+            && !locals.contains_key(callee.segments()[0])
+        {
+            return Some(PendingValue::LiteralArgs {
+                callee: callee.segments().iter().map(|s| (*s).to_string()).collect(),
+                argument: Box::new(argument.clone()),
+            });
+        }
     }
     if let Expr::Attribute(attr) = call.func.as_ref() {
         let view = match attr.attr.as_str() {
@@ -446,6 +559,7 @@ fn pending_call(
         (container, _, _) if CONTAINER_BUILTINS.contains(&container) => {
             Some(PendingValue::Literal(LiteralValue::Opaque))
         }
+        ("object", [], true) => Some(PendingValue::Literal(LiteralValue::Opaque)),
         _ => None,
     }
 }
@@ -579,10 +693,23 @@ impl ConstantScope {
                                 })
                         })
                         .collect();
+                    child.custom_construction = class_def
+                        .keywords()
+                        .iter()
+                        .any(|keyword| keyword.arg.as_deref() == Some("metaclass"))
+                        || !class_def
+                            .decorator_list
+                            .iter()
+                            .all(|decorator| is_transparent_class_decorator(&decorator.expression))
+                        || CUSTOM_CONSTRUCTION_MEMBERS.iter().any(|member| {
+                            child.defined_functions.contains(*member)
+                                || child.bindings.contains_key(*member)
+                        });
                     scope.children.insert(class_def.name.to_string(), child);
                     continue;
                 }
                 Stmt::FunctionDef(func) => {
+                    scope.defined_functions.insert(func.name.to_string());
                     if func.decorator_list.is_empty() {
                         scope.functions.insert(func.name.to_string());
                     }
@@ -616,6 +743,12 @@ impl ConstantScope {
             if let (Expr::Name(name), Some(value_expr)) = (target, value) {
                 // Global markers may be imported or computed; let pytest apply them.
                 scope.runtime_parameters |= name.id.as_str() == "pytestmark";
+                let alias = (matches!(
+                    value_expr,
+                    Expr::Subscript(_) | Expr::Name(_) | Expr::Attribute(_)
+                ) && !scope.bindings.contains_key(name.id.as_str()))
+                .then(|| value_expr.clone());
+                scope.aliases.insert(name.id.to_string(), alias);
                 record_assignment(&mut scope, name.id.as_str(), value_expr, names);
             }
         }
@@ -713,6 +846,56 @@ fn imported_expression_name(
             .collect::<Vec<_>>()
             .join("."),
     )
+}
+
+fn expr_segments(expr: &Expr) -> Option<Vec<String>> {
+    Some(
+        UnqualifiedName::from_expr(expr)?
+            .segments()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    )
+}
+
+/// Walk nested class scopes: `["Outer", "Inner"]`.
+fn class_scope<'a>(scope: &'a ConstantScope, path: &[String]) -> Option<&'a ConstantScope> {
+    path.iter()
+        .try_fold(scope, |scope, name| scope.children.get(name))
+}
+
+/// A builtin base such as `Exception`, whose methods are not parsed.
+fn segments_are_builtin(base: &str) -> bool {
+    base == "object" || NAMED_BUILTINS.contains(&base)
+}
+
+fn is_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
+        && chars.all(|c| c == '_' || c.is_alphanumeric())
+}
+
+/// Scalars and enum members are the values `Literal[...]` can hold here.
+fn literal_member(value: LiteralValue) -> Option<LiteralValue> {
+    matches!(
+        value,
+        LiteralValue::String(_)
+            | LiteralValue::Int(_)
+            | LiteralValue::Bool(_)
+            | LiteralValue::None
+            | LiteralValue::EnumMember(_)
+    )
+    .then_some(value)
+}
+
+fn is_transparent_class_decorator(decorator: &Expr) -> bool {
+    let decorator = match decorator {
+        Expr::Call(call) => call.func.as_ref(),
+        other => other,
+    };
+    UnqualifiedName::from_expr(decorator)
+        .and_then(|name| name.segments().last().copied())
+        .is_some_and(|last| TRANSPARENT_CLASS_DECORATORS.contains(&last))
 }
 
 fn is_enum_class_name(name: &str) -> bool {
@@ -994,6 +1177,335 @@ impl ConstantResolver {
         }
     }
 
+    /// Follow a dotted callee through module scopes and imports to a class or an external name.
+    fn find_callee(
+        &self,
+        module_path: &[String],
+        enclosing_class: Option<&str>,
+        path: &[String],
+        depth: usize,
+    ) -> Option<Callee> {
+        if depth > MAX_IMPORT_DEPTH {
+            return None;
+        }
+        let module = Rc::clone(self.modules.borrow().get(module_path)?);
+        let (first, rest) = path.split_first()?;
+        if let Some(class) = enclosing_class.and_then(|name| module.scope.children.get(name)) {
+            if class.children.contains_key(first) {
+                let nested: Vec<String> = std::iter::once(enclosing_class?.to_string())
+                    .chain(path.iter().cloned())
+                    .collect();
+                return self.find_callee(module_path, None, &nested, depth);
+            }
+            if class.bindings.contains_key(first) || class.defined_functions.contains(first) {
+                return None;
+            }
+        }
+        if module.scope.children.contains_key(first) {
+            class_scope(&module.scope, path)?;
+            return Some(Callee::Class {
+                module: module_path.to_vec(),
+                path: path.to_vec(),
+            });
+        }
+        if module.scope.bindings.contains_key(first)
+            || module.scope.defined_functions.contains(first)
+        {
+            return None;
+        }
+        let import = module.imports.get(first)?;
+        let target: Vec<String> = import.imported_name.iter().chain(rest).cloned().collect();
+        if target.is_empty() {
+            return None;
+        }
+        if !is_skipped_module(&import.module_path) {
+            self.ensure_loaded(&import.module_path, depth + 1);
+        }
+        if !self.modules.borrow().contains_key(&import.module_path) {
+            let qualified: Vec<&str> = import
+                .module_path
+                .iter()
+                .chain(&target)
+                .map(String::as_str)
+                .collect();
+            return Some(Callee::External(qualified.join(".")));
+        }
+        self.find_callee(&import.module_path, None, &target, depth + 1)
+    }
+
+    /// Whether a call produces an object that pytest IDs positionally.
+    fn call_returns_object(
+        &self,
+        module_path: &[String],
+        enclosing_class: Option<&str>,
+        callee: &[String],
+        depth: usize,
+    ) -> bool {
+        match self.find_callee(module_path, enclosing_class, callee, depth) {
+            Some(Callee::Class { module, path }) => {
+                return self.instance_is_object(&module, &path, true, depth)
+            }
+            Some(Callee::External(name)) => {
+                return OBJECT_RETURNING_CALLABLES.contains(&name.as_str())
+            }
+            None => {}
+        }
+        if let Some((method, owner)) = callee.split_last().filter(|(_, owner)| !owner.is_empty()) {
+            if let Some(Callee::Class { module, path }) =
+                self.find_callee(module_path, enclosing_class, owner, depth)
+            {
+                return self
+                    .method_return(&module, &path, method, depth)
+                    .is_some_and(|(def_module, annotation)| {
+                        self.return_is_object(
+                            &def_module,
+                            &annotation,
+                            Some((&module, &path)),
+                            depth,
+                        )
+                    });
+            }
+        }
+        self.function_return(module_path, enclosing_class, callee, depth)
+            .is_some_and(|(def_module, annotation)| {
+                self.return_is_object(&def_module, &annotation, None, depth)
+            })
+    }
+
+    /// Whether instances of a parsed class are plain objects rather than values pytest IDs
+    /// by value or `__name__`. `constructed` also rejects classes that customize construction.
+    fn instance_is_object(
+        &self,
+        module_path: &[String],
+        class_path: &[String],
+        constructed: bool,
+        depth: usize,
+    ) -> bool {
+        if depth > MAX_IMPORT_DEPTH {
+            return false;
+        }
+        let Some(module) = self.modules.borrow().get(module_path).map(Rc::clone) else {
+            return false;
+        };
+        let Some(class) = class_scope(&module.scope, class_path) else {
+            return false;
+        };
+        if constructed && class.custom_construction {
+            return false;
+        }
+        class.bases.iter().all(|base| {
+            let last = base.rsplit('.').next().unwrap_or(base);
+            if is_enum_class_name(base)
+                || is_enum_class_name(last)
+                || VALUE_TYPE_NAMES.contains(&last)
+            {
+                return false;
+            }
+            let segments: Vec<String> = base.split('.').map(String::from).collect();
+            match self.find_callee(module_path, None, &segments, depth + 1) {
+                Some(Callee::Class { module, path }) => {
+                    self.instance_is_object(&module, &path, constructed, depth + 1)
+                }
+                // Unparsed bases (stdlib, pydantic, ORM models, ...) are trusted unless their
+                // names mark them as enums or value types, matching return-annotation checks.
+                Some(Callee::External(_)) => true,
+                None => segments_are_builtin(base),
+            }
+        })
+    }
+
+    /// Find a method's return annotation on a class or the one base that defines it.
+    fn method_return(
+        &self,
+        module_path: &[String],
+        class_path: &[String],
+        method: &str,
+        depth: usize,
+    ) -> Option<(Vec<String>, Expr)> {
+        if depth > MAX_IMPORT_DEPTH {
+            return None;
+        }
+        let module = Rc::clone(self.modules.borrow().get(module_path)?);
+        let class = class_scope(&module.scope, class_path)?;
+        if let Some(returns) = class.returns.get(method) {
+            return Some((module_path.to_vec(), returns.clone()));
+        }
+        if class.defined_functions.contains(method)
+            || class.bindings.contains_key(method)
+            || class.children.contains_key(method)
+        {
+            return None;
+        }
+        // Without computing the MRO, accept a method only when exactly one base defines it.
+        let mut found = None;
+        for base in &class.bases {
+            if segments_are_builtin(base) {
+                continue;
+            }
+            let segments: Vec<String> = base.split('.').map(String::from).collect();
+            let Some(Callee::Class { module, path }) =
+                self.find_callee(module_path, None, &segments, depth + 1)
+            else {
+                return None;
+            };
+            if let Some(returns) = self.method_return(&module, &path, method, depth + 1) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(returns);
+            }
+        }
+        found
+    }
+
+    /// Whether a return annotation names an object type. `Self` refers to `owner`.
+    fn return_is_object(
+        &self,
+        def_module: &[String],
+        annotation: &Expr,
+        owner: Option<(&[String], &[String])>,
+        depth: usize,
+    ) -> bool {
+        let segments: Vec<String> = match annotation {
+            Expr::StringLiteral(text) => {
+                let text = text.value.to_str();
+                if !text.split('.').all(is_identifier) {
+                    return false;
+                }
+                text.split('.').map(String::from).collect()
+            }
+            Expr::Name(_) | Expr::Attribute(_) => match UnqualifiedName::from_expr(annotation) {
+                Some(name) => name.segments().iter().map(|s| (*s).to_string()).collect(),
+                None => return false,
+            },
+            _ => return self.annotation_is_object(def_module, annotation, depth),
+        };
+        if segments.last().map(String::as_str) == Some("Self") {
+            return owner.is_some_and(|(module, class)| {
+                self.instance_is_object(module, class, false, depth)
+            });
+        }
+        if let Some(Callee::Class { module, path }) =
+            self.find_callee(def_module, None, &segments, depth)
+        {
+            return self.instance_is_object(&module, &path, false, depth);
+        }
+        match annotation {
+            Expr::StringLiteral(_) => self.is_object_class(def_module, &segments, depth),
+            _ => self.annotation_is_object(def_module, annotation, depth),
+        }
+    }
+
+    /// The values `typing.get_args` returns for a `Literal[...]` type, flattened and
+    /// de-duplicated like `typing.Literal` does.
+    fn literal_type_values(
+        &self,
+        module_path: &[String],
+        expr: &Expr,
+        depth: usize,
+    ) -> Option<Vec<LiteralValue>> {
+        if depth > MAX_IMPORT_DEPTH {
+            return None;
+        }
+        let subscript = match expr {
+            Expr::Subscript(subscript) => subscript,
+            Expr::Name(_) | Expr::Attribute(_) => {
+                let (alias_module, alias) =
+                    self.find_alias(module_path, &expr_segments(expr)?, depth)?;
+                return self.literal_type_values(&alias_module, &alias, depth + 1);
+            }
+            _ => return None,
+        };
+        let base: Vec<String> = UnqualifiedName::from_expr(&subscript.value)?
+            .segments()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        match self.find_callee(module_path, None, &base, depth)? {
+            Callee::External(name) if LITERAL_TYPES.contains(&name.as_str()) => {}
+            _ => return None,
+        }
+        let elements = match subscript.slice.as_ref() {
+            Expr::Tuple(tuple) => tuple.elts.as_slice(),
+            single => std::slice::from_ref(single),
+        };
+        let mut values: Vec<LiteralValue> = Vec::new();
+        for element in elements {
+            let resolved = match element {
+                Expr::Subscript(_) => self.literal_type_values(module_path, element, depth + 1)?,
+                Expr::Name(_) | Expr::Attribute(_) => self
+                    .find_alias(module_path, &expr_segments(element)?, depth)
+                    .and_then(|(alias_module, alias)| {
+                        self.literal_type_values(&alias_module, &alias, depth + 1)
+                    })
+                    .or_else(|| {
+                        Some(vec![self.resolve_literal_member(
+                            module_path,
+                            element,
+                            depth,
+                        )?])
+                    })?,
+                Expr::StringLiteral(_)
+                | Expr::NumberLiteral(_)
+                | Expr::UnaryOp(_)
+                | Expr::BooleanLiteral(_)
+                | Expr::NoneLiteral(_) => vec![literal_member(try_extract_literal(element)?)?],
+                _ => return None,
+            };
+            for value in resolved {
+                if !values.contains(&value) {
+                    values.push(value);
+                }
+            }
+        }
+        Some(values)
+    }
+
+    /// A name used as a `Literal[...]` member: an enum member or a scalar constant.
+    fn resolve_literal_member(
+        &self,
+        module_path: &[String],
+        expr: &Expr,
+        depth: usize,
+    ) -> Option<LiteralValue> {
+        let name = UnqualifiedName::from_expr(expr)?;
+        let path: Vec<String> = name.segments().iter().map(|s| (*s).to_string()).collect();
+        let value = self.lookup_path_at(module_path, None, name.segments(), depth)?;
+        literal_member(value.into_literal(&path))
+    }
+
+    /// The assigned expression behind a possibly imported alias name.
+    fn find_alias(
+        &self,
+        module_path: &[String],
+        path: &[String],
+        depth: usize,
+    ) -> Option<(Vec<String>, Expr)> {
+        if depth > MAX_IMPORT_DEPTH {
+            return None;
+        }
+        let module = Rc::clone(self.modules.borrow().get(module_path)?);
+        let (import, imported) = match path {
+            [single] => {
+                if let Some(alias) = module.scope.aliases.get(single) {
+                    return alias.clone().map(|alias| (module_path.to_vec(), alias));
+                }
+                if module.scope.bindings.contains_key(single) {
+                    return None;
+                }
+                let import = module.imports.get(single)?;
+                (import, import.imported_name.clone()?)
+            }
+            [module_name, member] => match module.imports.get(module_name) {
+                Some(import) if import.imported_name.is_none() => (import, member.clone()),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        self.ensure_loaded(&import.module_path, depth + 1);
+        self.find_alias(&import.module_path, &[imported], depth + 1)
+    }
+
     /// Whether every value of an annotated type is an object pytest IDs positionally.
     fn annotation_is_object(
         &self,
@@ -1168,11 +1680,49 @@ impl ConstantResolver {
                 values: values.iter().map(resolve).collect::<Option<_>>()?,
                 id: id.clone(),
             }),
-            PendingValue::CallResult(callee) => {
-                let (def_module, annotation) =
-                    self.function_return(module_path, enclosing_class, callee, depth)?;
-                self.annotation_is_object(&def_module, &annotation, depth)
-                    .then_some(LiteralValue::Opaque)
+            PendingValue::CallResult(callee) => self
+                .call_returns_object(module_path, enclosing_class, callee, depth)
+                .then_some(LiteralValue::Opaque),
+            PendingValue::LiteralArgs { callee, argument } => {
+                match self.find_callee(module_path, enclosing_class, callee, depth)? {
+                    Callee::External(name) if GET_ARGS_CALLABLES.contains(&name.as_str()) => {}
+                    _ => return None,
+                }
+                self.literal_type_values(module_path, argument, depth)
+                    .map(LiteralValue::Sequence)
+            }
+            PendingValue::Index { source, key } => match (resolve(source)?, resolve(key)?) {
+                (LiteralValue::Sequence(items), LiteralValue::Int(index)) => {
+                    let index = if index < 0 {
+                        items.len().checked_sub(index.unsigned_abs() as usize)?
+                    } else {
+                        index as usize
+                    };
+                    items.into_iter().nth(index)
+                }
+                (LiteralValue::Mapping(entries), key)
+                    if matches!(
+                        key,
+                        LiteralValue::String(_) | LiteralValue::EnumMember(_) | LiteralValue::None
+                    ) =>
+                {
+                    entries
+                        .into_iter()
+                        .find(|(existing, _)| *existing == key)
+                        .and_then(|(_, value)| value)
+                }
+                _ => None,
+            },
+            PendingValue::FString(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    match resolve(part)? {
+                        LiteralValue::String(value) => text.push_str(&value),
+                        LiteralValue::Int(value) => text.push_str(&value.to_string()),
+                        _ => return None,
+                    }
+                }
+                Some(LiteralValue::String(text))
             }
             PendingValue::Slice {
                 source,
@@ -1376,5 +1926,127 @@ pub(crate) fn try_extract_literal(expr: &Expr) -> Option<LiteralValue> {
             Some(LiteralValue::Sequence(values?))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruff_python_parser::parse_module;
+
+    /// Resolve the final expression statement of `source` as a parametrize value.
+    fn resolve_last(source: &str) -> Option<LiteralValue> {
+        let parsed = parse_module(source).expect("valid source");
+        let module = parsed.into_syntax();
+        let resolver = ConstantResolver::from_module(&module);
+        let Some(Stmt::Expr(last)) = module.body.last() else {
+            panic!("source must end with an expression");
+        };
+        resolver.resolve_expr(None, &last.value, &LocalValues::new())
+    }
+
+    fn strings(values: &[&str]) -> LiteralValue {
+        LiteralValue::Sequence(
+            values
+                .iter()
+                .map(|v| LiteralValue::String((*v).into()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn test_get_args_flattens_and_deduplicates_literals() {
+        let source = indoc::indoc! {r#"
+            import typing
+            from typing import Literal, TypeAlias, get_args
+            Inner = Literal["a", "b"]
+            Outer: TypeAlias = Literal[Inner, "c", typing.Literal["a", "d"]]
+            get_args(Outer)
+        "#};
+        assert_eq!(resolve_last(source), Some(strings(&["a", "b", "c", "d"])));
+    }
+
+    #[test]
+    fn test_get_args_keeps_values_of_different_types() {
+        let source = indoc::indoc! {r#"
+            from typing_extensions import Literal, get_args
+            get_args(Literal[1, True, None, "1"])
+        "#};
+        assert_eq!(
+            resolve_last(source),
+            Some(LiteralValue::Sequence(vec![
+                LiteralValue::Int(1),
+                LiteralValue::Bool(true),
+                LiteralValue::None,
+                LiteralValue::String("1".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_get_args_needs_typing_and_a_literal() {
+        for source in [
+            "from typing import Literal, Union, get_args\nget_args(Union[Literal['a'], Literal['b']])",
+            "from typing import Literal\ndef get_args(x): return x\nget_args(Literal['a'])",
+            "from typing import get_args\nfrom other import Literal\nget_args(Literal['a'])",
+            "from typing import Literal, get_args\nget_args(Literal[b'a'])",
+        ] {
+            assert_eq!(resolve_last(source), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn test_class_calls_are_objects() {
+        let source = indoc::indoc! {r#"
+            from dataclasses import dataclass
+            class _Base:
+                @classmethod
+                def create(cls) -> "_Base": return cls()
+            @dataclass(frozen=True)
+            class _Row(_Base):
+                class Inner(Exception):
+                    pass
+            [_Row(), _Row.Inner(), _Row.create()]
+        "#};
+        assert_eq!(
+            resolve_last(source),
+            Some(LiteralValue::Sequence(vec![LiteralValue::Opaque; 3]))
+        );
+    }
+
+    #[test]
+    fn test_value_like_classes_are_not_objects() {
+        for source in [
+            "import enum\nclass _E(enum.Enum):\n    A = 1\n_E(1)",
+            "class _S(str):\n    pass\n_S('x')",
+            "class _N:\n    def __new__(cls): return 1\n_N()",
+            "class _M(metaclass=type):\n    pass\n_M()",
+            "class _G:\n    def __getattr__(self, name): return name\n_G()",
+            "def wrap(cls): return cls\n@wrap\nclass _W:\n    pass\n_W()",
+            "from vendor import StrEnum\nclass _V(StrEnum):\n    pass\n_V()",
+            "class _B:\n    @classmethod\n    def make(cls) -> int: return 1\nclass _C(_B):\n    pass\n_C.make()",
+        ] {
+            assert_eq!(resolve_last(source), None, "{source}");
+        }
+    }
+
+    #[test]
+    fn test_allowlisted_callables_and_external_bases_are_objects() {
+        for source in [
+            "from dateutil.relativedelta import relativedelta\nrelativedelta(days=1)",
+            "import pyarrow as pa\npa.array([])",
+            "import uuid\nuuid.UUID(int=1)",
+            "from contextlib import nullcontext as does_not_raise\ndoes_not_raise()",
+            "import dataclasses\ndataclasses.replace(x, y=1)",
+            "from datetime import timezone, timedelta\ntimezone(timedelta(hours=1))",
+            "object()",
+            "from vendor import Model\nclass _M(Model):\n    pass\n_M()",
+        ] {
+            assert_eq!(resolve_last(source), Some(LiteralValue::Opaque), "{source}");
+        }
+        assert_eq!(
+            resolve_last("from vendor import relativedelta\nrelativedelta(days=1)"),
+            None
+        );
     }
 }
