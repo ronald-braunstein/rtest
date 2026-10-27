@@ -1,5 +1,6 @@
 //! Configuration parsing for pytest settings from pyproject.toml
 
+use crate::python_discovery::ParametrizeWrapper;
 use log::debug;
 use std::path::{Path, PathBuf};
 use toml::Value;
@@ -127,6 +128,38 @@ fn strict_ids_in_table(table: &Value) -> bool {
             .unwrap_or(false)
 }
 
+/// Read `[[tool.rtest.parametrize-wrappers]]` entries from `pyproject.toml`.
+///
+/// Entries without a string `decorator` and `argname` are ignored, so tests using them keep
+/// collecting as undecorated functions exactly as before.
+pub fn read_parametrize_wrappers(root_path: &Path) -> Vec<ParametrizeWrapper> {
+    let Some(toml_value) = std::fs::read_to_string(root_path.join("pyproject.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<Value>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let entries = toml_value
+        .get("tool")
+        .and_then(|t| t.get("rtest"))
+        .and_then(|r| r.get("parametrize-wrappers"))
+        .and_then(Value::as_array);
+    let string =
+        |entry: &Value, key: &str| entry.get(key).and_then(Value::as_str).map(String::from);
+    entries
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(ParametrizeWrapper {
+                decorator: string(entry, "decorator")?,
+                argname: string(entry, "argname")?,
+                record: string(entry, "record"),
+                id_field: string(entry, "id-field"),
+            })
+        })
+        .collect()
+}
+
 /// Read a TOML array of strings under the given `key`, yielding an iterator of
 /// its string elements. Returns `None` when the key is absent or not an array.
 fn read_string_array<'a>(
@@ -238,5 +271,47 @@ mod tests {
         );
         assert_eq!(config.python_classes, ["Test*", "Check*", "*Suite"]);
         assert_eq!(config.python_functions, ["test*", "check_*", "*_test"]);
+    }
+
+    #[test]
+    fn reads_parametrize_wrappers_and_skips_incomplete_entries() {
+        let temp_dir = TempDir::new().expect("temporary project");
+        fs::write(
+            temp_dir.path().join("pyproject.toml"),
+            indoc! {r#"
+            [[tool.rtest.parametrize-wrappers]]
+            decorator = "pkg.testing.parametrize"
+            argname = "p"
+            record = "pkg.testing.Params"
+            id-field = "id"
+
+            [[tool.rtest.parametrize-wrappers]]
+            decorator = "pkg.other.parametrize"
+            argname = "case"
+
+            [[tool.rtest.parametrize-wrappers]]
+            decorator = "pkg.incomplete.parametrize"
+        "#},
+        )
+        .expect("write configuration");
+
+        assert_eq!(
+            read_parametrize_wrappers(temp_dir.path()),
+            [
+                ParametrizeWrapper {
+                    decorator: "pkg.testing.parametrize".into(),
+                    argname: "p".into(),
+                    record: Some("pkg.testing.Params".into()),
+                    id_field: Some("id".into()),
+                },
+                ParametrizeWrapper {
+                    decorator: "pkg.other.parametrize".into(),
+                    argname: "case".into(),
+                    record: None,
+                    id_field: None,
+                },
+            ]
+        );
+        assert!(read_parametrize_wrappers(&temp_dir.path().join("missing")).is_empty());
     }
 }

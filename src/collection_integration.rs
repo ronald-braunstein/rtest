@@ -34,6 +34,8 @@ pub fn collect_tests_rust(
 ) -> Result<(Vec<String>, CollectionErrors), CollectionError> {
     let mut session = Session::new(rootpath);
     session.config.duplicate_ids = duplicate_ids;
+    session.config.parametrize_wrappers =
+        crate::config::read_parametrize_wrappers(&session.rootpath);
     let mut collection_errors = CollectionErrors {
         errors: Vec::new(),
         warnings: Vec::new(),

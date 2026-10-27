@@ -352,6 +352,97 @@ def test_hybrid_collection_matches_pytest() -> None:
         # Compare multisets: pytest 7 itself can emit duplicates for colliding explicit IDs.
 
 
+def test_parametrize_wrapper_matches_pytest() -> None:
+    files = {
+        "pyproject.toml": """
+            [[tool.rtest.parametrize-wrappers]]
+            decorator = "helpers.params.parametrize"
+            argname = "p"
+            record = "helpers.params.Params"
+            id-field = "id"
+        """,
+        "helpers/__init__.py": "",
+        "helpers/params.py": """
+            from operator import attrgetter
+            import pytest
+            class Params:
+                def __init__(self, **kwargs):
+                    for key, value in kwargs.items():
+                        setattr(self, key, value)
+            def parametrize(argdefs, argvalues, ids=None):
+                def decorator(f):
+                    if argvalues and isinstance(argvalues[0], Params):
+                        records = argvalues
+                    else:
+                        records = [Params(**dict(zip(argdefs, row))) for row in argvalues]
+                    idfunc = ids
+                    if not idfunc and "id" in argdefs:
+                        idfunc = attrgetter("id")
+                    return pytest.mark.parametrize("p", records, ids=idfunc)(f)
+                return decorator
+        """,
+        "test_static_wrapper.py": """
+            import pytest
+            from datetime import date
+            from helpers.params import Params, parametrize
+            from helpers import params
+            def helper(): return object()
+            @parametrize(["amount", "when"], [Params(amount=helper(), when=date(2024, 1, 1)), Params(amount=2)])
+            def test_records_without_id(p): pass
+            @parametrize(["id", "amount"], [Params(id="first", amount=helper()), Params(id="caf\u00e9", amount=2)])
+            def test_record_ids(p): pass
+            @parametrize(["id", "amount"], [Params(id=None, amount=1), Params(id=7, amount=2)])
+            def test_scalar_and_missing_ids(p): pass
+            @parametrize(["id", "amount"], [("row-a", helper()), ("row-b", 2)])
+            def test_row_ids(p): pass
+            @parametrize(["amount"], [(helper(),), (2,)])
+            def test_rows_without_id(p): pass
+            @parametrize("amount", [Params(id="ignored", amount=1)])
+            def test_string_argdefs_without_id(p): pass
+            @parametrize("valid_amount", [Params(id="sub", amount=1)])
+            def test_string_argdefs_substring(p): pass
+            @parametrize(["id"], [Params(id="dup"), Params(id="dup")])
+            def test_duplicate_ids(p): pass
+            @parametrize(["amount"], [Params(amount=1), Params(amount=2)], ids=["one", "two"])
+            def test_explicit_ids(p): pass
+            @parametrize(["id", "amount"], [Params(id="from-field", amount=1)], ids=[])
+            def test_empty_ids_use_field(p): pass
+            @pytest.mark.parametrize("x", [1, 2])
+            @params.parametrize(["id"], [Params(id="a"), Params(id="b")])
+            def test_stacked(x, p): pass
+            class TestWrapped:
+                @parametrize(["id", "amount"], [Params(id="m1", amount=1), Params(id="m2", amount=2)])
+                def test_method(self, p): pass
+        """,
+        "test_runtime_wrapper.py": """
+            from helpers.params import Params, parametrize
+            def make_id(): return "made"
+            CASES = [Params(id="a")]
+            @parametrize(["id"], [Params(id=make_id())])
+            def test_call_id(p): pass
+            @parametrize(["id"], CASES)
+            def test_named_cases(p): pass
+            @parametrize(["amount"], [Params(amount=1)], ids=lambda p: "x")
+            def test_callable_ids(p): pass
+        """,
+    }
+    with create_test_project({name: textwrap.dedent(source) for name, source in files.items()}) as root:
+        test_files = ["test_static_wrapper.py", "test_runtime_wrapper.py"]
+        report = root / "fallback.txt"
+        version = oracle_pytest_version()
+        result = collect(root, "--cannot-expand-report", str(report), "--pytest-version", version, *test_files)
+        assert result.returncode == 0, result.output
+        reported = {
+            normalize_nodeid(line.removeprefix("rtest-cannot-expand: ")) for line in report.read_text().splitlines()
+        }
+        assert {nodeid.split("::", 1)[0] for nodeid in reported} == {"test_runtime_wrapper.py"}
+        assert len(reported) == 3, reported
+        collected = [normalize_nodeid(line) for line in extract_test_lines(result.output_lines)]
+        static = [nodeid for nodeid in collected if nodeid not in reported]
+        fallback = [nodeid for nodeid in pytest_collect(root, test_files) if nodeid.split("[", 1)[0] in reported]
+        assert sorted(static + fallback) == sorted(pytest_collect(root, test_files))
+
+
 def test_cannot_expand_report_destinations_and_lifecycle() -> None:
     files = {
         "test_dynamic.py": (
