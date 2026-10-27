@@ -615,11 +615,76 @@ fn extract_literal(
         Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::Generator(_) => {
             return Err(CannotExpandReason::Comprehension);
         }
-        // Dicts, sets, source-path calls, and other countable expressions are opaque.
+        Expr::FString(fstring) if id_style == ParamIdStyle::RuntimeValue => {
+            let value = eval_fstring(fstring, resolver, enclosing_class)
+                .ok_or_else(|| CannotExpandReason::UnsupportedExpression("f-string".into()))?;
+            LiteralValue::String(value)
+        }
+        // Dicts and sets are IDed positionally; other expressions may evaluate to values
+        // pytest IDs by value.
+        Expr::Dict(_) | Expr::Set(_) => LiteralValue::Opaque,
+        _ if id_style == ParamIdStyle::RuntimeValue => {
+            return Err(CannotExpandReason::UnsupportedExpression(
+                "expression evaluated at runtime".into(),
+            ))
+        }
+        // Source-path IDs only need a count.
         _ => LiteralValue::Opaque,
     };
     let id = CaseId::from_literal(&literal);
     Ok((literal, id))
+}
+
+/// Evaluate an f-string whose interpolations are constants formatted with `str()`.
+fn eval_fstring(
+    fstring: &ruff_python_ast::ExprFString,
+    resolver: &ConstantResolver,
+    enclosing_class: Option<&str>,
+) -> Option<String> {
+    use ruff_python_ast::{ConversionFlag, FStringPartRef, InterpolatedStringElement};
+    let mut text = String::new();
+    for part in fstring.value.iter() {
+        let fstring = match part {
+            FStringPartRef::Literal(literal) => {
+                text.push_str(&literal.value);
+                continue;
+            }
+            FStringPartRef::FString(fstring) => fstring,
+        };
+        for element in fstring.elements.iter() {
+            let interpolation = match element {
+                InterpolatedStringElement::Literal(literal) => {
+                    text.push_str(&literal.value);
+                    continue;
+                }
+                InterpolatedStringElement::Interpolation(interpolation) => interpolation,
+            };
+            if interpolation.debug_text.is_some()
+                || interpolation.format_spec.is_some()
+                || !matches!(
+                    interpolation.conversion,
+                    ConversionFlag::None | ConversionFlag::Str
+                )
+            {
+                return None;
+            }
+            let value = match interpolation.expression.as_ref() {
+                expr @ (Expr::Name(_) | Expr::Attribute(_)) => {
+                    resolver.resolve_in_class(enclosing_class, expr)?.value
+                }
+                Expr::BytesLiteral(_) => return None,
+                expr => try_extract_literal(expr)?,
+            };
+            match value {
+                LiteralValue::String(value) => text.push_str(&value),
+                LiteralValue::Int(value) => text.push_str(&value.to_string()),
+                LiteralValue::Bool(value) => text.push_str(if value { "True" } else { "False" }),
+                LiteralValue::None => text.push_str("None"),
+                _ => return None,
+            }
+        }
+    }
+    Some(text)
 }
 
 fn extract_pytest_param(

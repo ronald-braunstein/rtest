@@ -84,6 +84,38 @@ def test_hybrid_collection_matches_pytest() -> None:
             @pytest.mark.parametrize("y", ["a", "a"])
             def test_stacked_duplicates(x, y): pass
         """,
+        "test_strings.py": """
+            import pytest
+            NAME = "n"
+            ONE = 1
+            class Ids:
+                PREFIX = "id"
+                FLAG = False
+            @pytest.mark.parametrize(
+                "value",
+                [f"x-{ONE}-{NAME}", f"{Ids.PREFIX}:{Ids.FLAG}:{None}", f"{NAME!s}" "-tail", {1, 2}, {"a": 1}],
+            )
+            def test_values(value): pass
+            class TestScoped:
+                LABEL = "scoped"
+                @pytest.mark.parametrize("value", [f"{LABEL}!"])
+                def test_class_attribute(self, value): pass
+        """,
+        # Expressions pytest IDs by their runtime value, one file each.
+        **{
+            f"test_runtime_{name}.py": f"import pytest\n{source}\n"
+            f'@pytest.mark.parametrize("value", {argvalues})\ndef test_item(value): pass\n'
+            for name, source, argvalues in [
+                ("fstring_format", "ONE = 1", '[f"{ONE:03}"]'),
+                ("fstring_repr", "NAME = 'n'", '[f"{NAME!r}"]'),
+                ("fstring_runtime", "import os", '[f"{os.sep}x"]'),
+                ("fstring_bytes", "", "[f\"{b'x'}\"]"),
+                ("conditional", "ONE = 1", '["a" if ONE else "b"]'),
+                ("comparison", "ONE = 1", "[ONE == 1]"),
+                ("subscript", "LOOKUP = {'k': 'v'}", "[LOOKUP['k']]"),
+                ("bool_op", "ONE = 1", "[ONE or 'x']"),
+            ]
+        },
         "test_duplicates.py": """
             import pytest
             @pytest.mark.parametrize("value", [1, 2, 3], ids=["a", "a", "a0"])
@@ -162,7 +194,9 @@ def test_hybrid_collection_matches_pytest() -> None:
         }
         fallback = {nodeid.split("::", 1)[0] for nodeid in reported}
         # Pytest 7 emits colliding duplicate IDs, which only runtime collection reproduces.
-        static_files = {"test_static.py"} | ({"test_duplicates.py"} if int(version.split(".")[0]) >= 8 else set())
+        static_files = {"test_static.py", "test_strings.py"} | (
+            {"test_duplicates.py"} if int(version.split(".")[0]) >= 8 else set()
+        )
         assert fallback == set(test_files) - static_files
         collected = [normalize_nodeid(line) for line in extract_test_lines(result.output_lines)]
         assert reported == {nodeid for nodeid in collected if nodeid.split("::", 1)[0] in fallback}
