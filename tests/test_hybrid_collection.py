@@ -87,6 +87,11 @@ def test_hybrid_collection_matches_pytest() -> None:
         "test_values.py": """
             import enum
             import pytest
+            UNPACKED = [1, 2]
+            @pytest.mark.parametrize("value", [*UNPACKED], ids=["one", "two"])
+            def test_unpacked(value): pass
+            @pytest.mark.parametrize("value", [*UNPACKED])
+            def test_unpacked_without_ids(value): pass
             class Color(enum.Enum):
                 RED = "r"
                 GREEN = "g"
@@ -238,11 +243,6 @@ def test_hybrid_collection_matches_pytest() -> None:
             def test_partial_ids(value): pass
             @pytest.mark.parametrize("value", [1, 2], ids=str)
             def test_callable_ids(value): pass
-            VALUES = [1, 2]
-            @pytest.mark.parametrize("value", [*VALUES], ids=["one", "two"])
-            def test_unpacked(value): pass
-            @pytest.mark.parametrize("value", [*VALUES])
-            def test_unpacked_without_ids(value): pass
             @pytest.mark.parametrize("value", [])
             def test_empty(value): pass
             import enum
@@ -503,6 +503,321 @@ def test_dict_items_match_pytest() -> None:
         static = [nodeid for nodeid in collected if nodeid not in reported]
         fallback = [nodeid for nodeid in pytest_collect(root, test_files) if nodeid.split("[", 1)[0] in reported]
         assert sorted(static + fallback) == sorted(pytest_collect(root, test_files))
+
+
+def assert_hybrid_matches_pytest(root: Path, test_files: list[str], expected_fallbacks: set[str]) -> None:
+    report = root / "fallback.txt"
+    version = oracle_pytest_version()
+    result = collect(root, "--cannot-expand-report", str(report), "--pytest-version", version, *test_files)
+    assert result.returncode == 0, result.output
+    reported = {normalize_nodeid(line.removeprefix("rtest-cannot-expand: ")) for line in report.read_text().splitlines()}
+    assert reported == expected_fallbacks
+    collected = [normalize_nodeid(line) for line in extract_test_lines(result.output_lines)]
+    static = [nodeid for nodeid in collected if nodeid not in reported]
+    expected = pytest_collect(root, test_files)
+    fallback = [nodeid for nodeid in expected if nodeid.split("[", 1)[0] in reported]
+    assert sorted(static + fallback) == sorted(expected)
+
+
+def test_literal_values_functions_match_pytest() -> None:
+    files = {
+        "pyproject.toml": """
+            [tool.rtest]
+            literal-values-functions = ["literals.LiteralTools.values", "literals.literal_values"]
+        """,
+        "literals.py": """
+            import types
+            import typing
+            from typing import Generic, Literal, TypeVar, Union, get_args, get_origin
+            T = TypeVar("T")
+            class LiteralTools(Generic[T]):
+                @classmethod
+                def values(cls, literal_type):
+                    if get_origin(literal_type) in (Union, types.UnionType):
+                        return tuple(v for member in get_args(literal_type) for v in cls.values(member))
+                    values = get_args(literal_type)
+                    if not all(isinstance(v, str) for v in values):
+                        raise TypeError(literal_type)
+                    return values
+            def literal_values(literal_type):
+                return LiteralTools.values(literal_type)
+            Env = Literal["prod", "dev", "prod"]
+            Extra = Literal["qa", "dev"]
+        """,
+        "test_static_literals.py": """
+            import typing
+            from typing import Literal, Optional, Union
+            import pytest
+            from literals import Env, Extra, LiteralTools, literal_values
+            Same = Literal["dev", "prod"]
+            Combined = Env | Extra
+            NAMES = LiteralTools.values(Combined)
+            @pytest.mark.parametrize("env", LiteralTools[Env].values(Env))
+            def test_subscripted_owner(env): pass
+            @pytest.mark.parametrize("env", LiteralTools.values(Env | Extra))
+            def test_pep604_union(env): pass
+            @pytest.mark.parametrize("env", LiteralTools.values(Union[Extra, Env, Same]))
+            def test_union_drops_equal_members(env): pass
+            @pytest.mark.parametrize("env", literal_values(typing.Union[Env, Literal["x"]]))
+            def test_function(env): pass
+            @pytest.mark.parametrize("env", NAMES)
+            def test_constant(env): pass
+            @pytest.mark.parametrize("env", [e for e in LiteralTools.values(Combined) if e != "qa"])
+            def test_comprehension(env): pass
+        """,
+        "test_runtime_literals.py": """
+            from typing import Literal
+            import pytest
+            from literals import LiteralTools
+            Mixed = Literal["a"] | int
+            def values(literal_type): return ("other",)
+            @pytest.mark.parametrize("env", LiteralTools.values(Mixed))
+            def test_non_literal_member(env): pass
+            @pytest.mark.parametrize("env", values(Literal["a"]))
+            def test_unconfigured_function(env): pass
+        """,
+    }
+    with create_test_project({name: textwrap.dedent(source) for name, source in files.items()}) as root:
+        assert_hybrid_matches_pytest(
+            root,
+            ["test_static_literals.py", "test_runtime_literals.py"],
+            {
+                "test_runtime_literals.py::test_non_literal_member",
+                "test_runtime_literals.py::test_unconfigured_function",
+            },
+        )
+
+
+def test_imported_class_constants_match_pytest() -> None:
+    files = {
+        "constants.py": """
+            from typing import ClassVar
+            class Lookup:
+                NAMES: ClassVar[dict[str, str]] = {"b": "Bee", "a": "Ay"}
+        """,
+        "test_imported_class_constants.py": """
+            import pytest
+            from constants import Lookup
+            @pytest.mark.parametrize("key", Lookup.NAMES.keys())
+            def test_keys(key): pass
+            @pytest.mark.parametrize("value", sorted(Lookup.NAMES.values()))
+            def test_values(value): pass
+        """,
+    }
+    with create_test_project({name: textwrap.dedent(source) for name, source in files.items()}) as root:
+        assert_hybrid_matches_pytest(root, ["test_imported_class_constants.py"], set())
+
+
+def test_star_imports_and_nested_bases_match_pytest() -> None:
+    files = {
+        "pkg/__init__.py": "",
+        "pkg/_gen/__init__.py": "",
+        "pkg/_gen/enums.py": """
+            from typing import Final, Literal, TypeAlias
+            class ThingEnums:
+                class Status:
+                    Enum: TypeAlias = Literal["ACTIVE", "CLOSED"]
+                    ACTIVE: Final = "ACTIVE"
+                    CLOSED: Final = "CLOSED"
+        """,
+        "pkg/_gen/entity.py": """
+            import enum
+            from pkg._gen.enums import ThingEnums
+            class Thing:
+                class Status(ThingEnums.Status):
+                    pass
+                class Color(enum.Enum):
+                    RED = "r"
+            def make_thing():
+                return Thing()
+        """,
+        "pkg/_gen/all_types.py": """
+            from pkg._gen.entity import Thing, make_thing
+            __all__ = ["Thing"]
+        """,
+        "pkg/types.py": """
+            from pkg._gen.all_types import *  # noqa: F403
+            from pkg._gen.all_types import __all__ as __all__
+        """,
+        "pkg/public.py": """
+            from .enums_reexport import *  # noqa: F403
+        """,
+        "pkg/enums_reexport.py": """
+            from pkg._gen.entity import *  # noqa: F403
+        """,
+        "pkg/dynamic.py": """
+            from pkg._gen.entity import *  # noqa: F403
+            __all__ = [name for name in list(globals()) if not name.startswith("_")]
+        """,
+        "pkg/dynamic_reexport.py": """
+            from pkg.dynamic import *  # noqa: F403
+        """,
+        "test_static_star.py": """
+            import pytest
+            from pkg.types import Thing
+            from pkg.public import ThingEnums, make_thing
+            @pytest.mark.parametrize("status", [Thing.Status.ACTIVE, Thing.Status.CLOSED])
+            def test_nested_base(status): pass
+            @pytest.mark.parametrize("status", [ThingEnums.Status.ACTIVE])
+            def test_public_names(status): pass
+            @pytest.mark.parametrize("value", [Thing, Thing.Status, make_thing])
+            def test_named(value): pass
+            @pytest.mark.parametrize("color", [Thing.Color.RED])
+            def test_nested_enum(color): pass
+        """,
+        "test_runtime_star.py": """
+            import pytest
+            from pkg.dynamic import Thing
+            from pkg.dynamic_reexport import Thing as Reexported
+            @pytest.mark.parametrize("status", [Thing.Status.ACTIVE])
+            def test_star_source(status): pass
+            @pytest.mark.parametrize("status", [Reexported.Status.ACTIVE])
+            def test_dynamic_all(status): pass
+        """,
+    }
+    with create_test_project({name: textwrap.dedent(source) for name, source in files.items()}) as root:
+        assert_hybrid_matches_pytest(
+            root,
+            ["test_static_star.py", "test_runtime_star.py"],
+            {"test_runtime_star.py::test_dynamic_all"},
+        )
+
+
+def test_unpacking_and_method_names_match_pytest() -> None:
+    files = {
+        "helpers.py": """
+            import functools
+            class Writer:
+                @staticmethod
+                def advance(ctx): pass
+                @classmethod
+                def build(cls): pass
+                def plain(self): pass
+                @functools.cache
+                def cached(self): pass
+            FIRST = ["a", "b"]
+        """,
+        "test_static_unpack.py": """
+            import pytest
+            from helpers import FIRST, Writer
+            BOTH = [*FIRST, "c", *("d",)]
+            @pytest.mark.parametrize("value", BOTH)
+            def test_named_unpack(value): pass
+            @pytest.mark.parametrize("value", [*FIRST, "z"])
+            def test_inline_unpack(value): pass
+            @pytest.mark.parametrize("action", [Writer.advance, Writer.build, Writer.plain])
+            def test_methods(action): pass
+            @pytest.mark.parametrize("status,action", [("s", Writer.advance), ("t", Writer.build)])
+            def test_method_rows(status, action): pass
+        """,
+        "test_runtime_unpack.py": """
+            import pytest
+            from helpers import Writer
+            MAPPING = {"k": 1}
+            @pytest.mark.parametrize("action", [Writer.cached])
+            def test_wrapping_decorator(action): pass
+            @pytest.mark.parametrize("value", [*"ab"])
+            def test_string_unpack(value): pass
+        """,
+    }
+    with create_test_project({name: textwrap.dedent(source) for name, source in files.items()}) as root:
+        assert_hybrid_matches_pytest(
+            root,
+            ["test_static_unpack.py", "test_runtime_unpack.py"],
+            {
+                "test_runtime_unpack.py::test_wrapping_decorator",
+                "test_runtime_unpack.py::test_string_unpack",
+            },
+        )
+
+
+def test_record_attribute_ids_match_pytest() -> None:
+    files = {
+        "records.py": """
+            import dataclasses
+            from dataclasses import dataclass, field
+            from typing import ClassVar, NamedTuple
+            @dataclass(frozen=True)
+            class Case:
+                KIND: ClassVar[str] = "case"
+                id: str
+                value: int = 0
+                tags: list = field(default_factory=list)
+            class Spec(NamedTuple):
+                name: str
+                kind: str = "k"
+            class Plain:
+                def __init__(self, name, *, code="c"):
+                    \"\"\"Holds a name.\"\"\"
+                    self.label = name
+                    self.code = code
+            @dataclasses.dataclass
+            class Checked:
+                id: str
+                def __post_init__(self):
+                    self.id = self.id.upper()
+            class Computed:
+                def __init__(self, name):
+                    self.label = name.upper()
+            @dataclass(frozen=True)
+            class Child(Case):
+                extra: str = ""
+        """,
+        "test_static_records.py": """
+            import pytest
+            from records import Case, Plain, Spec
+            def compute(): return 3
+            CASES = [Case("a", 1), Case(id="b", value=compute())]
+            SPECS = [Spec("x"), Spec(name="y", kind="z")]
+            PLAINS = [Plain("p"), Plain(name="q", code="r")]
+            FIRST = Case("first")
+            @pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
+            def test_lambda(case): pass
+            @pytest.mark.parametrize("case", CASES, ids=[case.id for case in CASES])
+            def test_comprehension(case): pass
+            @pytest.mark.parametrize("spec", SPECS, ids=lambda spec: spec.kind)
+            def test_named_tuple(spec): pass
+            @pytest.mark.parametrize("plain", PLAINS, ids=lambda plain: plain.label)
+            def test_init_attribute(plain): pass
+            @pytest.mark.parametrize("plain", PLAINS, ids=lambda plain: plain.code)
+            def test_keyword_default(plain): pass
+            @pytest.mark.parametrize("case", CASES, ids=lambda case: None)
+            def test_none(case): pass
+            @pytest.mark.parametrize("cls", [Case, Spec, Plain], ids=lambda cls: cls.__name__)
+            def test_class_names(cls): pass
+            @pytest.mark.parametrize("case", [Case("i"), pytest.param(Case("j"), id="own")], ids=lambda c: c.id)
+            def test_inline(case): pass
+            @pytest.mark.parametrize("value", [FIRST.id, FIRST.value])
+            def test_constant_attribute(value): pass
+        """,
+        "test_runtime_records.py": """
+            import pytest
+            from records import Case, Checked, Child, Computed
+            def compute(): return "x"
+            @pytest.mark.parametrize("case", [Checked("a")], ids=lambda case: case.id)
+            def test_post_init(case): pass
+            @pytest.mark.parametrize("case", [Computed("a")], ids=lambda case: case.label)
+            def test_computed_init(case): pass
+            @pytest.mark.parametrize("case", [Child("a")], ids=lambda case: case.id)
+            def test_inherited(case): pass
+            @pytest.mark.parametrize("case", [Case(compute())], ids=lambda case: case.id)
+            def test_unknown_field(case): pass
+            @pytest.mark.parametrize("case", [Case("a")], ids=lambda case: case)
+            def test_object_id(case): pass
+        """,
+    }
+    with create_test_project({name: textwrap.dedent(source) for name, source in files.items()}) as root:
+        assert_hybrid_matches_pytest(
+            root,
+            ["test_static_records.py", "test_runtime_records.py"],
+            {
+                "test_runtime_records.py::test_post_init",
+                "test_runtime_records.py::test_computed_init",
+                "test_runtime_records.py::test_inherited",
+                "test_runtime_records.py::test_unknown_field",
+                "test_runtime_records.py::test_object_id",
+            },
+        )
 
 
 def test_cannot_expand_report_destinations_and_lifecycle() -> None:

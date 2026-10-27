@@ -111,7 +111,8 @@ impl SemanticTestDiscovery {
             &module_path,
             module_resolver.clone(),
             path,
-        );
+        )
+        .with_literal_values_functions(&self.config.literal_values_functions);
 
         // First pass: collect imports
         let imports = self.collect_imports(&ast_module);

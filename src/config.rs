@@ -128,6 +128,28 @@ fn strict_ids_in_table(table: &Value) -> bool {
             .unwrap_or(false)
 }
 
+/// Read `[tool.rtest] literal-values-functions` from `pyproject.toml`: qualified names of
+/// functions that return the values of a `Literal` type (or a union of them) like `get_args`.
+pub fn read_literal_values_functions(root_path: &Path) -> Vec<String> {
+    std::fs::read_to_string(root_path.join("pyproject.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<Value>(&text).ok())
+        .and_then(|toml_value| {
+            toml_value
+                .get("tool")?
+                .get("rtest")?
+                .get("literal-values-functions")?
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(String::from))
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
 /// Read `[[tool.rtest.parametrize-wrappers]]` entries from `pyproject.toml`.
 ///
 /// Entries without a string `decorator` and `argname` are ignored, so tests using them keep

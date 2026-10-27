@@ -36,6 +36,8 @@ pub fn collect_tests_rust(
     session.config.duplicate_ids = duplicate_ids;
     session.config.parametrize_wrappers =
         crate::config::read_parametrize_wrappers(&session.rootpath);
+    session.config.literal_values_functions =
+        crate::config::read_literal_values_functions(&session.rootpath);
     let mut collection_errors = CollectionErrors {
         errors: Vec::new(),
         warnings: Vec::new(),
