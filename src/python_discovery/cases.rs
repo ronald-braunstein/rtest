@@ -4,11 +4,12 @@
 //! parametrized tests into individual test cases during collection.
 
 use ruff_python_ast::name::UnqualifiedName;
-use ruff_python_ast::{Decorator, Expr, ExprList, ExprTuple, Keyword};
+use ruff_python_ast::{Decorator, Expr, ExprCall, ExprList, ExprTuple, Keyword};
 
 use super::constant_resolver::{
     try_extract_literal, ConstantResolver, LocalValues, ResolvedConstant,
 };
+use super::discovery::TestDiscoveryConfig;
 
 /// A literal value that can be statically extracted from AST.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +44,25 @@ pub struct CasesSpec {
     pub ids: Vec<String>,
     /// Pytest IDs, already made unique per decorator; any duplicates left need runtime collection.
     pub pytest_unique_ids: bool,
+}
+
+/// A project decorator that forwards to `pytest.mark.parametrize(argname, records, ids=...)`.
+///
+/// Configured under `[[tool.rtest.parametrize-wrappers]]`. The wrapper takes
+/// `(argnames, argvalues, ids=None)` and passes every case to the test as one record argument:
+/// argvalues that are already `record` calls are used as-is, other rows are zipped with
+/// `argnames` into records. When `id_field` appears in `argnames`, each record's `id_field`
+/// value is the case ID (pytest's `ids=attrgetter(id_field)`); otherwise IDs are `argnameN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParametrizeWrapper {
+    /// Fully qualified decorator, e.g. `package.testing.parametrize`.
+    pub decorator: String,
+    /// The single argument name the wrapper passes to pytest.
+    pub argname: String,
+    /// Fully qualified record class whose keyword arguments become attributes.
+    pub record: Option<String>,
+    /// Record attribute used as the case ID when it is listed in argnames.
+    pub id_field: Option<String>,
 }
 
 /// How `@pytest.mark.parametrize` duplicate IDs are made unique; pytest 8 changed the rule.
@@ -173,9 +193,9 @@ pub fn parse_decorators_for_cases(
     decorators: &[Decorator],
     resolver: &ConstantResolver,
     enclosing_class: Option<&str>,
-    duplicate_ids: DuplicateIds,
+    config: &TestDiscoveryConfig,
 ) -> CasesExpansion {
-    match parse_decorators_to_specs(decorators, resolver, enclosing_class, duplicate_ids) {
+    match parse_decorators_to_specs(decorators, resolver, enclosing_class, config) {
         Ok(specs) => expand_cases(specs.iter()),
         Err(reason) => CasesExpansion::CannotExpand(reason),
     }
@@ -189,7 +209,7 @@ pub fn parse_decorators_to_specs(
     decorators: &[Decorator],
     resolver: &ConstantResolver,
     enclosing_class: Option<&str>,
-    duplicate_ids: DuplicateIds,
+    config: &TestDiscoveryConfig,
 ) -> MethodCasesInfo {
     if resolver.has_runtime_parameters() {
         return Err(CannotExpandReason::UnsupportedExpression(
@@ -199,7 +219,7 @@ pub fn parse_decorators_to_specs(
     decorators
         .iter()
         .filter_map(|decorator| {
-            parse_single_decorator(decorator, resolver, enclosing_class, duplicate_ids).transpose()
+            parse_single_decorator(decorator, resolver, enclosing_class, config).transpose()
         })
         .collect()
 }
@@ -224,11 +244,25 @@ fn parse_single_decorator(
     decorator: &Decorator,
     resolver: &ConstantResolver,
     enclosing_class: Option<&str>,
-    duplicate_ids: DuplicateIds,
+    config: &TestDiscoveryConfig,
 ) -> Result<Option<CasesSpec>, CannotExpandReason> {
     let Expr::Call(call) = &decorator.expression else {
         return Ok(None);
     };
+    let duplicate_ids = config.duplicate_ids;
+
+    let decorator_name = resolver.imported_expression_name(&call.func);
+    if let Some(wrapper) = config
+        .parametrize_wrappers
+        .iter()
+        .find(|wrapper| decorator_name.as_deref() == Some(wrapper.decorator.as_str()))
+    {
+        let ids = extract_wrapper_ids(call, wrapper, resolver, enclosing_class)?;
+        return Ok(Some(CasesSpec {
+            ids: duplicate_ids.apply(ids),
+            pytest_unique_ids: true,
+        }));
+    }
 
     let Some(id_style) = decorator_id_style(&call.func, resolver) else {
         return Ok(None);
@@ -302,6 +336,125 @@ fn parse_single_decorator(
         },
         pytest_unique_ids,
     }))
+}
+
+/// Case IDs for a configured parametrize wrapper (see [`ParametrizeWrapper`]).
+///
+/// Only the case count and record IDs are needed: other record fields never reach the ID.
+fn extract_wrapper_ids(
+    call: &ExprCall,
+    wrapper: &ParametrizeWrapper,
+    resolver: &ConstantResolver,
+    enclosing_class: Option<&str>,
+) -> Result<Vec<String>, CannotExpandReason> {
+    let unsupported = |why: &str| CannotExpandReason::UnsupportedExpression(why.into());
+    let [argnames, values] = call.arguments.args.as_ref() else {
+        return Err(unsupported(
+            "wrapper takes argnames, argvalues, and keyword ids",
+        ));
+    };
+    let cases = sequence_elts(values)
+        .filter(|cases| !cases.iter().any(Expr::is_starred_expr))
+        .ok_or_else(|| unsupported("wrapper argvalues must be a list or tuple"))?;
+
+    // The wrapper replaces falsy `ids` (None or empty) with the id field when it can.
+    let explicit_ids = extract_ids_kwarg(&call.arguments.keywords, resolver, enclosing_class)?;
+    match &explicit_ids {
+        Some(ids) if !ids.is_empty() && ids.len() == cases.len() => return Ok(ids.clone()),
+        Some(ids) if !ids.is_empty() => {
+            return Err(unsupported("ids length must match a static case sequence"))
+        }
+        _ => {}
+    }
+    let positional_ids = || {
+        if explicit_ids.is_some() && !cases.is_empty() {
+            // Pytest rejects `ids=[]` for a non-empty case list.
+            return Err(unsupported("ids length must match a static case sequence"));
+        }
+        Ok((0..cases.len())
+            .map(|index| format!("{}{index}", wrapper.argname))
+            .collect())
+    };
+
+    let Some(id_field) = wrapper.id_field.as_deref() else {
+        return positional_ids();
+    };
+    // `id_field in argnames`: substring test for a string, membership for a sequence.
+    let row_names = match argnames {
+        Expr::StringLiteral(names) if names.value.to_str().contains(id_field) => None,
+        Expr::StringLiteral(_) => return positional_ids(),
+        _ => Some(extract_argnames(argnames)?.names),
+    };
+    let id_index = match &row_names {
+        Some(names) => match names.iter().position(|name| name == id_field) {
+            Some(index) => Some(index),
+            None => return positional_ids(),
+        },
+        None => None,
+    };
+    let positional = |index: usize| format!("{}{index}", wrapper.argname);
+
+    fn as_record<'a>(
+        case: &'a Expr,
+        wrapper: &ParametrizeWrapper,
+        resolver: &ConstantResolver,
+    ) -> Option<&'a ExprCall> {
+        match case {
+            Expr::Call(record)
+                if wrapper.record.is_some()
+                    && resolver.imported_expression_name(&record.func) == wrapper.record =>
+            {
+                Some(record)
+            }
+            _ => None,
+        }
+    }
+    let record_call = |case| as_record(case, wrapper, resolver);
+    let records = cases
+        .first()
+        .is_some_and(|case| record_call(case).is_some());
+    cases
+        .iter()
+        .enumerate()
+        .map(|(index, case)| {
+            let id_expr = if records {
+                let record = record_call(case)
+                    .ok_or_else(|| unsupported("wrapper cases mix records and rows"))?;
+                if record.arguments.keywords.iter().any(|kw| kw.arg.is_none()) {
+                    return Err(unsupported("record uses **kwargs"));
+                }
+                record
+                    .arguments
+                    .find_keyword(id_field)
+                    .map(|kw| &kw.value)
+                    .ok_or_else(|| unsupported("record has no static id field"))?
+            } else {
+                // Rows are zipped with argnames, so the ID comes from the matching column.
+                let row = sequence_elts(case)
+                    .filter(|row| !row.iter().any(Expr::is_starred_expr))
+                    .ok_or_else(|| unsupported("wrapper row must be a list or tuple"))?;
+                id_index
+                    .and_then(|index| row.get(index))
+                    .ok_or_else(|| unsupported("wrapper row has no id column"))?
+            };
+            let (id, _) = extract_literal(
+                id_expr,
+                resolver,
+                enclosing_class,
+                ParamIdStyle::RuntimeValue,
+            )?;
+            match id {
+                LiteralValue::None => Ok(positional(index)),
+                LiteralValue::Int(_)
+                | LiteralValue::Float(_)
+                | LiteralValue::String(_)
+                | LiteralValue::Bool(_)
+                | LiteralValue::EnumMember(_)
+                | LiteralValue::Named(_) => Ok(literal_to_id_string(&id)),
+                _ => Err(unsupported("record id is not a static scalar")),
+            }
+        })
+        .collect()
 }
 
 /// Identify `@rtest.mark.cases` and imported aliases of `@pytest.mark.parametrize`.

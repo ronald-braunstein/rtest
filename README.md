@@ -130,6 +130,24 @@ warning: Cannot statically expand test cases for 'test.py::test_comprehension': 
 In these cases, test execution is still functionally equivalent - pytest automatically runs all parametrized variants
 when given the base function name.
 
+#### Project-specific parametrize decorators
+
+Projects that wrap `pytest.mark.parametrize` in their own decorator can describe the wrapper in `pyproject.toml` so
+`rtest` expands it statically:
+
+```toml
+[[tool.rtest.parametrize-wrappers]]
+decorator = "myproject.testing.parametrize"    # fully qualified decorator name
+argname = "p"                                  # the single argname the wrapper passes to pytest
+record = "myproject.testing.Params"            # optional: row type accepted in place of tuples
+id-field = "id"                                # optional: field whose value becomes the test ID
+```
+
+The wrapper is called as `@parametrize(argnames, argvalues, ids=None)` and passes every case to the test as one
+`argname` argument: argvalues that are already `record` calls are used as-is, and other rows are zipped with
+`argnames`. IDs come from a static `ids=` list, then from `id-field` when the argnames include it, and otherwise
+default to `{argname}{index}`. Anything that cannot be resolved statically falls back to pytest, as above.
+
 ### Path Separator Handling
 
 `rtest` uses platform-specific path separators in test nodeids, while `pytest` normalizes all paths to use forward
