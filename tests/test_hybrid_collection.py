@@ -130,6 +130,85 @@ def test_hybrid_collection_matches_pytest() -> None:
             @pytest.mark.parametrize("value", [{"a": 1}, (1, 2), make_plain()])
             def test_positional(value): pass
         """,
+        "shapes.py": """
+            from typing import Literal, Self
+            Size = Literal["s", "m"]
+            class Base:
+                @classmethod
+                def create(cls, code: str) -> "Base": return cls()
+                @classmethod
+                def build(cls) -> Self: return cls()
+            class Mixin:
+                pass
+            class Error(Mixin, Base):
+                pass
+            class Shape:
+                class Corner:
+                    pass
+                @staticmethod
+                def make() -> "Shape": return Shape()
+        """,
+        "test_calls.py": """
+            import enum
+            import typing
+            import uuid
+            from contextlib import nullcontext as does_not_raise
+            from dataclasses import dataclass, replace
+            from datetime import timedelta, timezone
+            from typing import Literal, TypeAlias, get_args
+            import pytest
+            import shapes
+            from shapes import Error, Shape, Size
+            class Color(enum.Enum):
+                RED = "r"
+            ONE = 1
+            Mode = Literal["a", "b", "a"]
+            Nested: TypeAlias = Literal[Mode, "c", Literal["d", "a"]]
+            Mixed = Literal[Color.RED, ONE, True, None, -2]
+            @dataclass
+            class _Row:
+                n: int
+            class _Outer:
+                class Inner:
+                    pass
+            @pytest.mark.parametrize("value", get_args(Mode))
+            def test_literal(value): pass
+            @pytest.mark.parametrize("value", typing.get_args(Nested))
+            def test_nested_literal(value): pass
+            @pytest.mark.parametrize("value", get_args(Mixed))
+            def test_mixed_literal(value): pass
+            @pytest.mark.parametrize("value", get_args(Size) + get_args(shapes.Size))
+            def test_imported_literal(value): pass
+            @pytest.mark.parametrize("value", [_Row(1), _Outer.Inner(), Shape.Corner(), Shape.make()])
+            def test_classes(value): pass
+            @pytest.mark.parametrize("value", [Error.create("x"), Error.build(), shapes.Base.build()])
+            def test_inherited_methods(value): pass
+            @pytest.mark.parametrize(
+                "value",
+                [
+                    replace(_Row(1), n=2),
+                    does_not_raise(),
+                    pytest.raises(ValueError),
+                    uuid.UUID(int=1),
+                    timezone(timedelta(hours=1)),
+                    object(),
+                ],
+            )
+            def test_allowlisted_calls(value): pass
+            NAME = "n"
+            PAIRS = [("a", 1), ("b", 2)]
+            LOOKUP = {"k": "v", Color.RED: "red"}
+            @pytest.mark.parametrize(
+                "value",
+                [f"x-{ONE}-{NAME}", f"{NAME!s}" "-tail", PAIRS[-1][0], PAIRS[1], LOOKUP["k"], LOOKUP[Color.RED]],
+            )
+            def test_evaluated_expressions(value): pass
+            class TestNested:
+                class _Case:
+                    pass
+                @pytest.mark.parametrize("value", [_Case()])
+                def test_class_scope(self, value): pass
+        """,
         "test_duplicates.py": """
             import pytest
             @pytest.mark.parametrize("value", [1, 2, 3], ids=["a", "a", "a0"])
@@ -160,6 +239,38 @@ def test_hybrid_collection_matches_pytest() -> None:
             @pytest.mark.parametrize("value", [m for m in Mode])
             def test_enum_iteration(value): pass
         """,
+        # Calls whose results pytest IDs by value or `__name__`, one file each.
+        **{
+            f"test_runtime_{name}.py": f"import pytest\n{source}\n"
+            f'@pytest.mark.parametrize("value", {argvalues})\ndef test_item(value): pass\n'
+            for name, source, argvalues in [
+                (
+                    "union_args",
+                    'from typing import Literal, Union, get_args\nEither = Union[Literal["a"], Literal["b"]]',
+                    "get_args(Either)",
+                ),
+                ("enum", "import enum\nclass _Mode(enum.Enum):\n    A = 'a'", "[_Mode('a')]"),
+                ("own_name", "class _Named:\n    __name__ = 'named'", "[_Named()]"),
+                ("str_subclass", "class _Text(str):\n    pass", "[_Text('t')]"),
+                ("custom_new", "class _Built:\n    def __new__(cls): return 'built'", "[_Built()]"),
+                (
+                    "metaclass",
+                    "class _Meta(type):\n    pass\nclass _WithMeta(metaclass=_Meta):\n    pass",
+                    "[_WithMeta()]",
+                ),
+                ("shadowed_allowlist", "def replace(value): return 'replaced'", "[replace(1)]"),
+                ("fstring_format", "ONE = 1", '[f"{ONE:03}"]'),
+                ("fstring_repr", "NAME = 'n'", '[f"{NAME!r}"]'),
+                ("conditional", "ONE = 1", '["a" if ONE else "b"]'),
+                ("comparison", "ONE = 1", "[ONE == 1]"),
+                (
+                    "value_return",
+                    "class _Base:\n    @classmethod\n    def code(cls) -> str: return 'c'\n"
+                    "class _Child(_Base):\n    pass",
+                    "[_Child.code()]",
+                ),
+            ]
+        },
         "test_fixture.py": """
             from pytest import fixture as fx, mark
             @fx(params=[1, 2])
@@ -214,7 +325,7 @@ def test_hybrid_collection_matches_pytest() -> None:
         }
         fallback = {nodeid.split("::", 1)[0] for nodeid in reported}
         # Pytest 7 emits colliding duplicate IDs, which only runtime collection reproduces.
-        static_files = {"test_static.py", "test_values.py"} | (
+        static_files = {"test_static.py", "test_values.py", "test_calls.py"} | (
             {"test_duplicates.py"} if int(version.split(".")[0]) >= 8 else set()
         )
         assert fallback == set(test_files) - static_files
