@@ -36,6 +36,9 @@ struct ConstantScope {
     returns: HashMap<String, Expr>,
     /// Every function defined in this scope, whatever its decorators.
     defined_functions: std::collections::HashSet<String>,
+    /// Bodies of parameterless functions, static methods and `cls`-only class methods that
+    /// only `return` an expression; `None` when the name is defined more than once.
+    return_values: HashMap<String, Option<ReturnedExpression>>,
     /// Assigned expressions that may be type aliases (`X = Literal[...]`); `None` when reassigned.
     aliases: HashMap<String, Option<Expr>>,
     /// For a class scope: instances may not be plain objects (`__new__`, a metaclass,
@@ -52,11 +55,14 @@ struct ConstantScope {
 /// `self.attribute = parameter`.
 #[derive(Debug)]
 struct RecordShape {
-    /// Constructor parameters in signature order.
+    /// Constructor parameters in signature order, after those of `base`.
     params: Vec<RecordParam>,
+    dataclass: bool,
+    /// The single base of a dataclass, whose fields must also come from a record dataclass.
+    base: Option<Vec<String>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RecordParam {
     name: String,
     keyword_only: bool,
@@ -107,6 +113,11 @@ enum PendingValue {
         ruff_python_ast::Operator,
         Box<PendingValue>,
     ),
+    /// `a | b`: an operator on values, or a union of type forms.
+    TypeOr {
+        union: Box<Expr>,
+        value: Box<PendingValue>,
+    },
     Param {
         values: Vec<PendingValue>,
         id: Option<String>,
@@ -141,12 +152,44 @@ enum PendingValue {
         callee: Vec<String>,
         argument: Box<Expr>,
     },
-    /// A one-argument call that returns a `Literal` type's values when the callee is a
-    /// configured literal-values function, and `otherwise` when it is not.
-    LiteralValuesCall {
+    /// A call whose result depends on the callee's configuration: a one-argument
+    /// literal-values function returns the `Literal` type's values, a passthrough function
+    /// returns its first argument, and any other callee gives `otherwise`.
+    ConfiguredCall {
         callee: Vec<String>,
+        /// The first positional argument, as an expression for literal-values functions.
         argument: Box<Expr>,
+        /// The first positional argument as a value, for passthrough functions.
+        argument_value: Option<Box<PendingValue>>,
+        single_argument: bool,
         otherwise: Option<Box<PendingValue>>,
+    },
+    /// A list comprehension or generator expression, with the enclosing comprehension's
+    /// variables already bound.
+    Comprehension {
+        elt: Box<Expr>,
+        generators: Vec<ruff_python_ast::Comprehension>,
+        locals: LocalValues,
+    },
+    /// `set(x)`, `frozenset(x)`, `{a, b}` or a set comprehension over the elements of `x`.
+    SetOf(Box<PendingValue>),
+    /// `Base[args]` where `Base` may be a generic type: a builtin like `list` or a typing
+    /// name, whose aliases pytest IDs by `__name__`; otherwise it is the `index` lookup.
+    Generic {
+        base: Vec<String>,
+        builtin: Option<&'static str>,
+        args: Box<Expr>,
+        index: Option<Box<PendingValue>>,
+    },
+    /// `enumerate(x, start)`.
+    Enumerate {
+        source: Box<PendingValue>,
+        start: i64,
+    },
+    /// `zip(a, b, ...)`; with `strict=True` the sources must have equal lengths.
+    Zip {
+        sources: Vec<PendingValue>,
+        strict: bool,
     },
 }
 
@@ -166,6 +209,104 @@ const OBJECT_RETURNING_CALLABLES: &[&str] = &[
 const GET_ARGS_CALLABLES: &[&str] = &["typing.get_args", "typing_extensions.get_args"];
 const LITERAL_TYPES: &[&str] = &["typing.Literal", "typing_extensions.Literal"];
 const UNION_TYPES: &[&str] = &["typing.Union", "typing_extensions.Union"];
+
+/// Members of `http.HTTPStatus` and `pytest.ExitCode`. Both are `IntEnum`s, which pytest IDs
+/// by their integer value.
+const INT_ENUM_MEMBERS: &[(&str, i64)] = &[
+    ("http.HTTPStatus.ACCEPTED", 202),
+    ("http.HTTPStatus.ALREADY_REPORTED", 208),
+    ("http.HTTPStatus.BAD_GATEWAY", 502),
+    ("http.HTTPStatus.BAD_REQUEST", 400),
+    ("http.HTTPStatus.CONFLICT", 409),
+    ("http.HTTPStatus.CONTENT_TOO_LARGE", 413),
+    ("http.HTTPStatus.CONTINUE", 100),
+    ("http.HTTPStatus.CREATED", 201),
+    ("http.HTTPStatus.EARLY_HINTS", 103),
+    ("http.HTTPStatus.EXPECTATION_FAILED", 417),
+    ("http.HTTPStatus.FAILED_DEPENDENCY", 424),
+    ("http.HTTPStatus.FORBIDDEN", 403),
+    ("http.HTTPStatus.FOUND", 302),
+    ("http.HTTPStatus.GATEWAY_TIMEOUT", 504),
+    ("http.HTTPStatus.GONE", 410),
+    ("http.HTTPStatus.HTTP_VERSION_NOT_SUPPORTED", 505),
+    ("http.HTTPStatus.IM_A_TEAPOT", 418),
+    ("http.HTTPStatus.IM_USED", 226),
+    ("http.HTTPStatus.INSUFFICIENT_STORAGE", 507),
+    ("http.HTTPStatus.INTERNAL_SERVER_ERROR", 500),
+    ("http.HTTPStatus.LENGTH_REQUIRED", 411),
+    ("http.HTTPStatus.LOCKED", 423),
+    ("http.HTTPStatus.LOOP_DETECTED", 508),
+    ("http.HTTPStatus.METHOD_NOT_ALLOWED", 405),
+    ("http.HTTPStatus.MISDIRECTED_REQUEST", 421),
+    ("http.HTTPStatus.MOVED_PERMANENTLY", 301),
+    ("http.HTTPStatus.MULTIPLE_CHOICES", 300),
+    ("http.HTTPStatus.MULTI_STATUS", 207),
+    ("http.HTTPStatus.NETWORK_AUTHENTICATION_REQUIRED", 511),
+    ("http.HTTPStatus.NON_AUTHORITATIVE_INFORMATION", 203),
+    ("http.HTTPStatus.NOT_ACCEPTABLE", 406),
+    ("http.HTTPStatus.NOT_EXTENDED", 510),
+    ("http.HTTPStatus.NOT_FOUND", 404),
+    ("http.HTTPStatus.NOT_IMPLEMENTED", 501),
+    ("http.HTTPStatus.NOT_MODIFIED", 304),
+    ("http.HTTPStatus.NO_CONTENT", 204),
+    ("http.HTTPStatus.OK", 200),
+    ("http.HTTPStatus.PARTIAL_CONTENT", 206),
+    ("http.HTTPStatus.PAYMENT_REQUIRED", 402),
+    ("http.HTTPStatus.PERMANENT_REDIRECT", 308),
+    ("http.HTTPStatus.PRECONDITION_FAILED", 412),
+    ("http.HTTPStatus.PRECONDITION_REQUIRED", 428),
+    ("http.HTTPStatus.PROCESSING", 102),
+    ("http.HTTPStatus.PROXY_AUTHENTICATION_REQUIRED", 407),
+    ("http.HTTPStatus.RANGE_NOT_SATISFIABLE", 416),
+    ("http.HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE", 416),
+    ("http.HTTPStatus.REQUEST_ENTITY_TOO_LARGE", 413),
+    ("http.HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE", 431),
+    ("http.HTTPStatus.REQUEST_TIMEOUT", 408),
+    ("http.HTTPStatus.REQUEST_URI_TOO_LONG", 414),
+    ("http.HTTPStatus.RESET_CONTENT", 205),
+    ("http.HTTPStatus.SEE_OTHER", 303),
+    ("http.HTTPStatus.SERVICE_UNAVAILABLE", 503),
+    ("http.HTTPStatus.SWITCHING_PROTOCOLS", 101),
+    ("http.HTTPStatus.TEMPORARY_REDIRECT", 307),
+    ("http.HTTPStatus.TOO_EARLY", 425),
+    ("http.HTTPStatus.TOO_MANY_REQUESTS", 429),
+    ("http.HTTPStatus.UNAUTHORIZED", 401),
+    ("http.HTTPStatus.UNAVAILABLE_FOR_LEGAL_REASONS", 451),
+    ("http.HTTPStatus.UNPROCESSABLE_CONTENT", 422),
+    ("http.HTTPStatus.UNPROCESSABLE_ENTITY", 422),
+    ("http.HTTPStatus.UNSUPPORTED_MEDIA_TYPE", 415),
+    ("http.HTTPStatus.UPGRADE_REQUIRED", 426),
+    ("http.HTTPStatus.URI_TOO_LONG", 414),
+    ("http.HTTPStatus.USE_PROXY", 305),
+    ("http.HTTPStatus.VARIANT_ALSO_NEGOTIATES", 506),
+    ("pytest.ExitCode.INTERNAL_ERROR", 3),
+    ("pytest.ExitCode.INTERRUPTED", 2),
+    ("pytest.ExitCode.MAX_WARNINGS_ERROR", 6),
+    ("pytest.ExitCode.NO_TESTS_COLLECTED", 5),
+    ("pytest.ExitCode.OK", 0),
+    ("pytest.ExitCode.TESTS_FAILED", 1),
+    ("pytest.ExitCode.USAGE_ERROR", 4),
+];
+
+/// Builtin classes whose subscription (`list[int]`) is a generic alias named like the class.
+const GENERIC_BUILTINS: &[&str] = &["dict", "frozenset", "list", "set", "tuple", "type"];
+
+/// Typing generics whose subscription keeps the generic's `__name__`.
+const TYPING_GENERICS: &[&str] = &[
+    "Annotated",
+    "Callable",
+    "DefaultDict",
+    "Dict",
+    "FrozenSet",
+    "Iterable",
+    "List",
+    "Literal",
+    "Mapping",
+    "Sequence",
+    "Set",
+    "Tuple",
+    "Type",
+];
 
 /// Class decorators that return the decorated class itself.
 const TRANSPARENT_CLASS_DECORATORS: &[&str] = &["dataclass", "final", "total_ordering"];
@@ -389,7 +530,7 @@ impl ModuleNames {
         NAMED_BUILTINS
             .iter()
             .chain(CONTAINER_BUILTINS)
-            .chain(&["range"])
+            .chain(&["range", "enumerate", "zip"])
             .find(|builtin| **builtin == name)
             .copied()
     }
@@ -397,6 +538,94 @@ impl ModuleNames {
 
 /// Values bound by an enclosing comprehension, which shadow module names.
 pub(crate) type LocalValues = HashMap<String, LiteralValue>;
+
+/// A member of a type union, as far as it decides the union's `__name__`.
+enum TypeMember {
+    None,
+    /// A class, by `__name__`; `key` identifies the class object.
+    Class {
+        name: String,
+        key: String,
+    },
+    /// `Literal[...]`, which compares equal to another holding the same set of values.
+    Literal(Vec<LiteralValue>),
+    /// A subscripted generic such as `list[int]`; `key` identifies its spelling.
+    Generic {
+        name: String,
+        key: String,
+    },
+}
+
+fn generic_key(module_path: &[String], expr: &Expr) -> String {
+    format!(
+        "{}:{:?}",
+        module_path.join("."),
+        ruff_python_ast::comparable::ComparableExpr::from(expr)
+    )
+}
+
+/// The value of a union of these members, which drops duplicates. A single remaining type
+/// is that type itself. Otherwise a `typing.Union` is named `Union`, or `Optional` for one
+/// type plus `None`, and a `types.UnionType` (`int | None`) has no `__name__`. Members that
+/// may or may not be equal (two classes sharing a name, two spellings of one generic) have
+/// no static value.
+fn union_value(members: Vec<TypeMember>, typing: bool) -> Option<LiteralValue> {
+    let mut distinct: Vec<TypeMember> = Vec::new();
+    let mut has_none = false;
+    for member in members {
+        let duplicate = match &member {
+            TypeMember::None => {
+                has_none = true;
+                continue;
+            }
+            TypeMember::Class { name, key } => {
+                let mut duplicate = false;
+                for other in &distinct {
+                    if let TypeMember::Class { name: other_name, key: other_key } = other {
+                        if other_key == key {
+                            duplicate = true;
+                        } else if other_name == name {
+                            return None;
+                        }
+                    }
+                }
+                duplicate
+            }
+            TypeMember::Literal(values) => distinct.iter().any(|other| {
+                matches!(other, TypeMember::Literal(other)
+                    if other.len() == values.len() && other.iter().all(|value| values.contains(value)))
+            }),
+            TypeMember::Generic { name, key } => {
+                let mut duplicate = false;
+                for other in &distinct {
+                    if let TypeMember::Generic { name: other_name, key: other_key } = other {
+                        if other_key == key {
+                            duplicate = true;
+                        } else if other_name == name {
+                            return None;
+                        }
+                    }
+                }
+                duplicate
+            }
+        };
+        if !duplicate {
+            distinct.push(member);
+        }
+    }
+    let name = match (distinct.as_slice(), has_none) {
+        ([single], false) => match single {
+            TypeMember::Class { name, .. } | TypeMember::Generic { name, .. } => name.clone(),
+            TypeMember::Literal(_) => "Literal".to_string(),
+            TypeMember::None => return None,
+        },
+        ([], _) => return None,
+        _ if !typing => return Some(LiteralValue::Opaque),
+        ([_], true) => "Optional".to_string(),
+        _ => "Union".to_string(),
+    };
+    Some(LiteralValue::Named(name))
+}
 
 /// Build a pending value from an expression without resolving names.
 fn pending_value(expr: &Expr, names: &ModuleNames, locals: &LocalValues) -> Option<PendingValue> {
@@ -428,28 +657,48 @@ fn pending_value(expr: &Expr, names: &ModuleNames, locals: &LocalValues) -> Opti
         }
         Expr::List(ruff_python_ast::ExprList { elts, .. })
         | Expr::Tuple(ruff_python_ast::ExprTuple { elts, .. }) => {
-            Some(PendingValue::Sequence(
-                elts.iter()
-                    .map(|elt| match elt {
-                        Expr::Starred(starred) => Some(PendingValue::Unpack(Box::new(
-                            pending_value(&starred.value, names, locals)?,
-                        ))),
-                        elt => pending_value(elt, names, locals),
-                    })
-                    .collect::<Option<_>>()?,
-            ))
+            pending_sequence(elts, names, locals)
         }
         Expr::Dict(dict) => Some(PendingValue::Mapping(
             dict.items
                 .iter()
-                .map(|item| {
-                    let key = pending_value(item.key.as_ref()?, names, locals)?;
-                    Some((key, pending_value(&item.value, names, locals)))
+                .map(|item| match item.key.as_ref() {
+                    Some(key) => Some((
+                        pending_value(key, names, locals)?,
+                        pending_value(&item.value, names, locals),
+                    )),
+                    // `**mapping` is stored as an unpacked key without a value.
+                    None => Some((
+                        PendingValue::Unpack(Box::new(pending_value(&item.value, names, locals)?)),
+                        None,
+                    )),
                 })
                 .collect::<Option<_>>()?,
         )),
-        // Set iteration order depends on hashing, so sets are only countable as single values.
-        Expr::Set(_) => Some(PendingValue::Literal(LiteralValue::Opaque)),
+        // A set with unknown members still counts as one positionally IDed value.
+        Expr::Set(set) => Some(
+            pending_sequence(&set.elts, names, locals)
+                .map_or(PendingValue::Literal(LiteralValue::Opaque), |items| {
+                    PendingValue::SetOf(Box::new(items))
+                }),
+        ),
+        Expr::ListComp(comp) => Some(comprehension(&comp.elt, &comp.generators, locals)),
+        Expr::Generator(comp) => Some(comprehension(&comp.elt, &comp.generators, locals)),
+        Expr::SetComp(comp) => Some(PendingValue::SetOf(Box::new(comprehension(
+            &comp.elt,
+            &comp.generators,
+            locals,
+        )))),
+        Expr::BinOp(binop) if binop.op == ruff_python_ast::Operator::BitOr && locals.is_empty() => {
+            Some(PendingValue::TypeOr {
+                union: Box::new(expr.clone()),
+                value: Box::new(PendingValue::BinOp(
+                    Box::new(pending_value(&binop.left, names, locals)?),
+                    binop.op,
+                    Box::new(pending_value(&binop.right, names, locals)?),
+                )),
+            })
+        }
         Expr::BinOp(binop) => Some(PendingValue::BinOp(
             Box::new(pending_value(&binop.left, names, locals)?),
             binop.op,
@@ -498,10 +747,23 @@ fn pending_value(expr: &Expr, names: &ModuleNames, locals: &LocalValues) -> Opti
         }
         Expr::Subscript(subscript) => {
             let Expr::Slice(slice) = subscript.slice.as_ref() else {
-                return Some(PendingValue::Index {
-                    source: Box::new(pending_value(&subscript.value, names, locals)?),
-                    key: Box::new(pending_value(&subscript.slice, names, locals)?),
-                });
+                let index = (|| {
+                    Some(PendingValue::Index {
+                        source: Box::new(pending_value(&subscript.value, names, locals)?),
+                        key: Box::new(pending_value(&subscript.slice, names, locals)?),
+                    })
+                })();
+                return match expr_segments(&subscript.value) {
+                    Some(base) if !locals.contains_key(&base[0]) => Some(PendingValue::Generic {
+                        builtin: names
+                            .builtin(&subscript.value)
+                            .filter(|name| GENERIC_BUILTINS.contains(name)),
+                        base,
+                        args: subscript.slice.clone(),
+                        index: index.map(Box::new),
+                    }),
+                    _ => index,
+                };
             };
             if slice.step.is_some() {
                 return None;
@@ -521,6 +783,37 @@ fn pending_value(expr: &Expr, names: &ModuleNames, locals: &LocalValues) -> Opti
         }
         Expr::Call(call) => pending_call(call, names, locals),
         _ => None,
+    }
+}
+
+fn pending_sequence(
+    elts: &[Expr],
+    names: &ModuleNames,
+    locals: &LocalValues,
+) -> Option<PendingValue> {
+    Some(PendingValue::Sequence(
+        elts.iter()
+            .map(|elt| match elt {
+                Expr::Starred(starred) => Some(PendingValue::Unpack(Box::new(pending_value(
+                    &starred.value,
+                    names,
+                    locals,
+                )?))),
+                elt => pending_value(elt, names, locals),
+            })
+            .collect::<Option<_>>()?,
+    ))
+}
+
+fn comprehension(
+    elt: &Expr,
+    generators: &[ruff_python_ast::Comprehension],
+    locals: &LocalValues,
+) -> PendingValue {
+    PendingValue::Comprehension {
+        elt: Box::new(elt.clone()),
+        generators: generators.to_vec(),
+        locals: locals.clone(),
     }
 }
 
@@ -569,11 +862,11 @@ fn pending_call(
             "items" => ElementView::Items,
             _ => {
                 let otherwise = record_call(call, names, locals, constructor_value(call, locals));
-                return literal_values_call(call, otherwise, locals);
+                return configured_call(call, otherwise, names, locals);
             }
         };
         if !args.is_empty() {
-            return literal_values_call(call, None, locals);
+            return configured_call(call, None, names, locals);
         }
         return Some(PendingValue::Elements {
             source: Box::new(pending_value(&attr.value, names, locals)?),
@@ -583,7 +876,7 @@ fn pending_call(
     }
     let Some(builtin) = names.builtin(&call.func) else {
         let otherwise = record_call(call, names, locals, constructor_value(call, locals));
-        return literal_values_call(call, otherwise, locals);
+        return configured_call(call, otherwise, names, locals);
     };
     match (builtin, args.args.as_ref(), args.keywords.is_empty()) {
         ("range", bounds, true) if (1..=3).contains(&bounds.len()) => {
@@ -612,12 +905,91 @@ fn pending_call(
             view: ElementView::Keys,
             sorted: builtin == "sorted",
         }),
+        ("enumerate", [source, rest @ ..], _) if rest.len() + args.keywords.len() <= 1 => {
+            let start = match (rest, args.keywords.as_ref()) {
+                ([], []) => None,
+                ([start], []) => Some(start),
+                ([], [keyword]) if keyword.arg.as_deref() == Some("start") => Some(&keyword.value),
+                _ => return None,
+            };
+            let start = match start.map(try_extract_literal) {
+                None => 0,
+                Some(Some(LiteralValue::Int(start))) => start,
+                Some(_) => return None,
+            };
+            Some(PendingValue::Enumerate {
+                source: Box::new(pending_value(source, names, locals)?),
+                start,
+            })
+        }
+        ("zip", sources, _) if !sources.iter().any(Expr::is_starred_expr) => {
+            let mut strict = false;
+            for keyword in &args.keywords {
+                match (keyword.arg.as_deref(), try_extract_literal(&keyword.value)) {
+                    (Some("strict"), Some(LiteralValue::Bool(value))) => strict = value,
+                    _ => return None,
+                }
+            }
+            Some(PendingValue::Zip {
+                sources: sources
+                    .iter()
+                    .map(|source| pending_value(source, names, locals))
+                    .collect::<Option<_>>()?,
+                strict,
+            })
+        }
+        ("set" | "frozenset", [], true) => {
+            Some(PendingValue::Literal(LiteralValue::Set(Vec::new())))
+        }
+        ("set" | "frozenset", [source], true) => Some(
+            pending_value(source, names, locals)
+                .map_or(PendingValue::Literal(LiteralValue::Opaque), |source| {
+                    PendingValue::SetOf(Box::new(source))
+                }),
+        ),
         (container, _, _) if CONTAINER_BUILTINS.contains(&container) => {
             Some(PendingValue::Literal(LiteralValue::Opaque))
         }
         ("object", [], true) => Some(PendingValue::Literal(LiteralValue::Opaque)),
+        ("float", [value], true) => {
+            let value = match try_extract_literal(value)? {
+                LiteralValue::String(text) => parse_python_float(&text)?,
+                LiteralValue::Float(value) => value,
+                LiteralValue::Int(value) if value.unsigned_abs() <= 1 << f64::MANTISSA_DIGITS => {
+                    value as f64
+                }
+                _ => return None,
+            };
+            Some(PendingValue::Literal(LiteralValue::Float(value)))
+        }
         _ => None,
     }
+}
+
+/// `float(text)` for the spellings Python accepts that Rust parses identically: decimal and
+/// exponent notation, `nan`, and `inf`/`infinity`, case-insensitively and surrounded by
+/// whitespace. Underscore digit grouping is left to Python.
+fn parse_python_float(text: &str) -> Option<f64> {
+    let text = text.trim().to_ascii_lowercase();
+    let (negative, magnitude) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text.as_str()),
+    };
+    let value = match magnitude {
+        "nan" => f64::NAN,
+        "inf" | "infinity" => f64::INFINITY,
+        digits
+            if digits.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+                && digits
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | '+' | '-')) =>
+        {
+            digits.parse::<f64>().ok()?
+        }
+        _ => return None,
+    };
+    Some(if negative { -value } else { value })
 }
 
 /// `Class(...)`: possibly a record construction, decided once names are resolved.
@@ -677,7 +1049,24 @@ fn record_shape(
     }
     let qualified = |expr: &Expr| imported_expression_name(expr, imports);
     match (class_def.decorator_list.as_slice(), class_def.bases()) {
-        ([decorator], []) => {
+        ([decorator], bases) => {
+            // `Generic[T]` adds no fields; a subscripted base is its class.
+            let mut base = None;
+            for class in bases {
+                let class = match class {
+                    Expr::Subscript(subscript) => subscript.value.as_ref(),
+                    class => class,
+                };
+                if matches!(
+                    qualified(class).as_deref(),
+                    Some("typing.Generic" | "typing_extensions.Generic")
+                ) {
+                    continue;
+                }
+                if base.replace(expr_segments(class)?).is_some() {
+                    return None;
+                }
+            }
             let (func, keywords) = match &decorator.expression {
                 Expr::Call(call) if call.arguments.args.is_empty() => {
                     (call.func.as_ref(), &call.arguments.keywords[..])
@@ -696,10 +1085,12 @@ fn record_shape(
             let custom_init = ["__init__", "__post_init__", "__setattr__"]
                 .iter()
                 .any(|name| scope.defined_functions.contains(*name));
-            (qualified(func).as_deref() == Some("dataclasses.dataclass")
+            let mut shape = (qualified(func).as_deref() == Some("dataclasses.dataclass")
                 && plain_options
                 && !custom_init)
-                .then(|| annotated_fields(class_def, imports, names, true))?
+                .then(|| annotated_fields(class_def, imports, names, true))??;
+            shape.base = base;
+            Some(shape)
         }
         ([], [base])
             if matches!(
@@ -777,7 +1168,11 @@ fn annotated_fields(
             default,
         });
     }
-    Some(RecordShape { params })
+    Some(RecordShape {
+        params,
+        dataclass,
+        base: None,
+    })
 }
 
 /// Fields of a class whose only `__init__` statements are `self.attribute = parameter`.
@@ -856,20 +1251,27 @@ fn init_fields(
             .attributes
             .push(attribute);
     }
-    Some(RecordShape { params })
+    Some(RecordShape {
+        params,
+        dataclass: false,
+        base: None,
+    })
 }
 
-/// `f(X)`, `Owner.f(X)` or `Owner[T].f(X)`: possibly a configured literal-values function,
-/// decided once names are resolved.
-fn literal_values_call(
+/// `f(X, ...)`, `Owner.f(X, ...)` or `Owner[T].f(X, ...)`: possibly a configured
+/// literal-values or passthrough function, decided once names are resolved.
+fn configured_call(
     call: &ruff_python_ast::ExprCall,
     otherwise: Option<PendingValue>,
+    names: &ModuleNames,
     locals: &LocalValues,
 ) -> Option<PendingValue> {
-    let ([argument], true) = (
-        call.arguments.args.as_ref(),
-        call.arguments.keywords.is_empty(),
-    ) else {
+    let Some(argument) = call
+        .arguments
+        .args
+        .first()
+        .filter(|arg| !arg.is_starred_expr())
+    else {
         return otherwise;
     };
     let callee = match call.func.as_ref() {
@@ -888,9 +1290,11 @@ fn literal_values_call(
     if locals.contains_key(&callee[0]) {
         return otherwise;
     }
-    Some(PendingValue::LiteralValuesCall {
+    Some(PendingValue::ConfiguredCall {
         callee,
         argument: Box::new(argument.clone()),
+        argument_value: pending_value(argument, names, locals).map(Box::new),
+        single_argument: call.arguments.args.len() == 1 && call.arguments.keywords.is_empty(),
         otherwise: otherwise.map(Box::new),
     })
 }
@@ -905,6 +1309,56 @@ fn attribute_value(value: &LiteralValue, attribute: &str) -> Option<LiteralValue
             .find(|(name, _)| name == attribute)
             .and_then(|(_, value)| value.clone()),
         (LiteralValue::Named(name), "__name__") => Some(LiteralValue::String(name.clone())),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReturnedExpression {
+    value: Expr,
+    /// The `cls` parameter of a class method, whose attributes are not tracked.
+    class_parameter: Option<String>,
+}
+
+/// The expression a function returns when its body is only that `return` (after an
+/// optional docstring): a parameterless function or `@staticmethod`, or a `@classmethod`
+/// whose only parameter is `cls`.
+fn returned_expression(func: &ruff_python_ast::StmtFunctionDef) -> Option<ReturnedExpression> {
+    let decorator = match func.decorator_list.as_slice() {
+        [] => None,
+        [decorator] => match &decorator.expression {
+            Expr::Name(name) => Some(name.id.as_str()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let parameters = &func.parameters;
+    let class_parameter = match decorator {
+        _ if func.is_async => return None,
+        None | Some("staticmethod") if parameters.is_empty() => None,
+        Some("classmethod")
+            if parameters.args.len() == 1
+                && parameters.posonlyargs.is_empty()
+                && parameters.kwonlyargs.is_empty()
+                && parameters.vararg.is_none()
+                && parameters.kwarg.is_none()
+                && parameters.args[0].default.is_none() =>
+        {
+            Some(parameters.args[0].parameter.name.to_string())
+        }
+        _ => return None,
+    };
+    let body = match func.body.as_slice() {
+        [Stmt::Expr(doc), rest @ ..] if doc.value.is_string_literal_expr() => rest,
+        body => body,
+    };
+    match body {
+        [Stmt::Return(ruff_python_ast::StmtReturn {
+            value: Some(value), ..
+        })] => Some(ReturnedExpression {
+            value: value.as_ref().clone(),
+            class_parameter,
+        }),
         _ => None,
     }
 }
@@ -926,6 +1380,31 @@ fn constructor_value(
 }
 
 const MAX_RANGE_LEN: usize = 10_000;
+
+/// A set of same-typed hashable scalars; mixed types could compare equal (`1 == True`).
+fn set_value(items: Vec<LiteralValue>) -> Option<LiteralValue> {
+    let mut members: Vec<LiteralValue> = Vec::with_capacity(items.len());
+    for item in items {
+        let same_kind = members
+            .first()
+            .is_none_or(|first| std::mem::discriminant(first) == std::mem::discriminant(&item));
+        if !same_kind
+            || !matches!(
+                item,
+                LiteralValue::String(_)
+                    | LiteralValue::Int(_)
+                    | LiteralValue::Bool(_)
+                    | LiteralValue::EnumMember(_)
+            )
+        {
+            return None;
+        }
+        if !members.contains(&item) {
+            members.push(item);
+        }
+    }
+    Some(LiteralValue::Set(members))
+}
 
 /// `sorted()` for homogeneous strings or ints; other mixes need Python's comparison rules.
 fn sort_literals(items: &mut [LiteralValue]) -> Option<()> {
@@ -989,6 +1468,8 @@ struct ImportBinding {
     module_path: Vec<String>,
     /// None for a module import; Some(name) for an imported member.
     imported_name: Option<String>,
+    /// For `import a.b.c` binding `a`: the dotted modules imported through this name.
+    submodules: Vec<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -1042,6 +1523,8 @@ pub struct ConstantResolver {
     loader: Option<ModuleResolver>,
     /// Qualified functions that return the values of a `Literal` type or union of them.
     literal_values_functions: Vec<String>,
+    /// Qualified functions that return their first argument unchanged, such as validators.
+    passthrough_functions: Vec<String>,
 }
 
 impl ConstantScope {
@@ -1091,6 +1574,11 @@ impl ConstantScope {
                     continue;
                 }
                 Stmt::FunctionDef(func) => {
+                    let body = (!scope.defined_functions.contains(func.name.as_str())
+                        && !scope.bindings.contains_key(func.name.as_str()))
+                    .then(|| returned_expression(func))
+                    .flatten();
+                    scope.return_values.insert(func.name.to_string(), body);
                     scope.defined_functions.insert(func.name.to_string());
                     // These decorators keep the function's `__name__`, which pytest uses as its ID.
                     if func.decorator_list.iter().all(|decorator| {
@@ -1153,22 +1641,30 @@ impl ConstantScope {
             || class.bases.iter().any(|base| self.class_is_enum(base))
     }
 
+    /// Pending bindings of this scope and its classes. `class` is the top-level class this
+    /// scope belongs to, `None` for the module; nested class bodies resolve against globals.
     fn collect_pending<'a>(
         &'a self,
         module_path: &'a [String],
+        class: Option<Option<&'a str>>,
         pending: &mut Vec<PendingAssignment<'a>>,
     ) {
         for binding in self.bindings.values() {
             if let BindingValue::Pending(pending_value) = &*binding.value.borrow() {
                 pending.push(PendingAssignment {
                     module_path,
+                    enclosing_class: class.flatten(),
                     value: &binding.value,
                     pending: Rc::clone(pending_value),
                 });
             }
         }
-        for child in self.children.values() {
-            child.collect_pending(module_path, pending);
+        for (name, child) in &self.children {
+            let child_class = match class {
+                None => Some(Some(name.as_str())),
+                Some(_) => Some(None),
+            };
+            child.collect_pending(module_path, child_class, pending);
         }
     }
 }
@@ -1318,6 +1814,7 @@ impl ConstantResolver {
             current_path,
             loader,
             literal_values_functions: Vec::new(),
+            passthrough_functions: Vec::new(),
         };
         let loaded = resolver.expand_star_imports(
             LoadedModule::from_module(module, &resolver.current_path, is_package),
@@ -1336,6 +1833,15 @@ impl ConstantResolver {
         if !functions.is_empty() {
             self.literal_values_functions = functions.to_vec();
             // Constants built from these calls could not resolve without the configuration.
+            self.resolve_pending_assignments();
+        }
+        self
+    }
+
+    /// Treat calls to these qualified functions as returning their first argument.
+    pub fn with_passthrough_functions(mut self, functions: &[String]) -> Self {
+        if !functions.is_empty() {
+            self.passthrough_functions = functions.to_vec();
             self.resolve_pending_assignments();
         }
         self
@@ -1412,6 +1918,7 @@ impl ConstantResolver {
                         ImportBinding {
                             module_path: star.clone(),
                             imported_name: Some(name),
+                            submodules: Vec::new(),
                         },
                     );
                 }
@@ -1462,13 +1969,18 @@ impl ConstantResolver {
                 .collect();
             let mut pending = Vec::new();
             for (path, module) in &modules {
-                module.scope.collect_pending(path, &mut pending);
+                module.scope.collect_pending(path, None, &mut pending);
             }
             let updates: Vec<_> = pending
                 .into_iter()
                 .filter_map(|assignment| {
-                    self.resolve_pending(assignment.module_path, None, &assignment.pending, 0)
-                        .map(|value| (assignment, value))
+                    self.resolve_pending(
+                        assignment.module_path,
+                        assignment.enclosing_class,
+                        &assignment.pending,
+                        0,
+                    )
+                    .map(|value| (assignment, value))
                 })
                 .collect();
             if updates.is_empty() {
@@ -1536,8 +2048,40 @@ impl ConstantResolver {
         if import.imported_name.is_none() && rest.is_empty() {
             return None;
         }
+        // `import a.b.c` then `a.b.c.X`: the longest imported submodule prefixing the path.
+        if let Some(submodule) = import
+            .submodules
+            .iter()
+            .filter(|submodule| {
+                submodule.len() < path.len()
+                    && submodule
+                        .iter()
+                        .zip(path)
+                        .all(|(part, segment)| part == segment)
+            })
+            .max_by_key(|submodule| submodule.len())
+        {
+            self.ensure_loaded(submodule, depth + 1);
+            return self.lookup_path_at(submodule, None, &path[submodule.len()..], depth + 1);
+        }
         let abs = &import.module_path;
         self.ensure_loaded(abs, depth + 1);
+        // `from pkg import sub` names the submodule when the package does not define `sub`.
+        if let (Some(name), false) = (&import.imported_name, rest.is_empty()) {
+            let defined = self
+                .modules
+                .borrow()
+                .get(abs)
+                .is_some_and(|package| package.defines(name));
+            if !defined {
+                let submodule: Vec<String> =
+                    abs.iter().chain(std::iter::once(name)).cloned().collect();
+                self.ensure_loaded(&submodule, depth + 1);
+                if self.modules.borrow().contains_key(&submodule) {
+                    return self.lookup_path_at(&submodule, None, rest, depth + 1);
+                }
+            }
+        }
         let imported_path: Vec<&str> = import
             .imported_name
             .iter()
@@ -1548,9 +2092,18 @@ impl ConstantResolver {
         // Stdlib and third-party modules are not parsed; their classes still ID by `__name__`.
         match (found, imported_path.as_slice()) {
             (None, [name])
-                if is_class_like_name(name) && !self.modules.borrow().contains_key(abs) =>
+                if (is_class_like_name(name)
+                    || (is_skipped_module(abs) && STDLIB_OBJECT_TYPES.contains(name)))
+                    && !self.modules.borrow().contains_key(abs) =>
             {
                 Some(ResolvedValue::Literal(LiteralValue::Named((*name).into())))
+            }
+            (None, [class, member]) if !self.modules.borrow().contains_key(abs) => {
+                let qualified = format!("{}.{class}.{member}", abs.join("."));
+                INT_ENUM_MEMBERS
+                    .iter()
+                    .find(|(name, _)| *name == qualified)
+                    .map(|(_, value)| ResolvedValue::Literal(LiteralValue::Int(*value)))
             }
             (found, _) => found,
         }
@@ -1921,33 +2474,32 @@ impl ConstantResolver {
         else {
             return None;
         };
-        let class_module = Rc::clone(self.modules.borrow().get(&module)?);
-        let shape = class_scope(&class_module.scope, &path)?.record.as_ref()?;
+        let params = self.record_params(&module, &path, depth)?;
         let argument = |value: &Option<PendingValue>| {
             value
                 .as_ref()
                 .and_then(|value| self.resolve_pending(module_path, enclosing_class, value, depth))
         };
-        let mut supplied: Vec<Option<Option<LiteralValue>>> = vec![None; shape.params.len()];
-        let positional = (0..shape.params.len()).filter(|&index| !shape.params[index].keyword_only);
+        let mut supplied: Vec<Option<Option<LiteralValue>>> = vec![None; params.len()];
+        let positional = (0..params.len()).filter(|&index| !params[index].1.keyword_only);
         let mut positional = positional.peekable();
         for arg in args {
             supplied[positional.next()?] = Some(argument(arg));
         }
         for (name, value) in keywords {
-            let index = shape.params.iter().position(|param| param.name == *name)?;
+            let index = params.iter().position(|(_, param)| param.name == *name)?;
             if supplied[index].replace(argument(value)).is_some() {
                 return None;
             }
         }
         let mut fields = Vec::new();
-        for (param, value) in shape.params.iter().zip(supplied) {
+        for ((param_module, param), value) in params.iter().zip(supplied) {
             let value = match (value, &param.default) {
                 (Some(value), _) => value,
                 (None, None) => return None,
-                (None, Some(default)) => default
-                    .as_ref()
-                    .and_then(|default| self.resolve_pending(&module, None, default, depth + 1)),
+                (None, Some(default)) => default.as_ref().and_then(|default| {
+                    self.resolve_pending(param_module, None, default, depth + 1)
+                }),
             };
             fields.extend(
                 param
@@ -1959,40 +2511,315 @@ impl ConstantResolver {
         Some(LiteralValue::Record(fields))
     }
 
-    /// Whether a callee path names a configured literal-values function, following imports.
-    fn is_literal_values_function(
+    /// The `__name__` of a subscripted typing generic. `Union` collapses duplicate members
+    /// and is named `Optional` for exactly one type plus `None`, so its members must be
+    /// distinct named types or `None`.
+    fn typing_alias_name(
+        &self,
+        module_path: &[String],
+        enclosing_class: Option<&str>,
+        typing_name: &str,
+        args: &Expr,
+        depth: usize,
+    ) -> Option<String> {
+        if TYPING_GENERICS.contains(&typing_name) {
+            return Some(typing_name.to_string());
+        }
+        let mut members = Vec::new();
+        match (typing_name, args) {
+            ("Optional", Expr::Tuple(_)) => return None,
+            ("Optional", member) => {
+                self.collect_type_members(module_path, member, depth, &mut members)?;
+                members.push(TypeMember::None);
+            }
+            ("Union", Expr::Tuple(tuple)) => {
+                for member in &tuple.elts {
+                    self.collect_type_members(module_path, member, depth, &mut members)?;
+                }
+            }
+            ("Union", member) => {
+                self.collect_type_members(module_path, member, depth, &mut members)?;
+            }
+            _ => return None,
+        }
+        let _ = enclosing_class;
+        match union_value(members, true)? {
+            LiteralValue::Named(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Flatten a union's members, following aliases. Returns whether any member is a typing
+    /// form, which makes `a | b` a `typing.Union` rather than a `types.UnionType`.
+    fn collect_type_members(
+        &self,
+        module_path: &[String],
+        expr: &Expr,
+        depth: usize,
+        members: &mut Vec<TypeMember>,
+    ) -> Option<bool> {
+        if depth > MAX_IMPORT_DEPTH {
+            return None;
+        }
+        match expr {
+            Expr::NoneLiteral(_) => {
+                members.push(TypeMember::None);
+                Some(false)
+            }
+            Expr::BinOp(binop) if binop.op == ruff_python_ast::Operator::BitOr => {
+                let left = self.collect_type_members(module_path, &binop.left, depth, members)?;
+                let right = self.collect_type_members(module_path, &binop.right, depth, members)?;
+                Some(left || right)
+            }
+            Expr::Subscript(subscript) => {
+                let base = expr_segments(&subscript.value)?;
+                if base.len() == 1
+                    && GENERIC_BUILTINS.contains(&base[0].as_str())
+                    && self.find_alias(module_path, &base, depth).is_none()
+                    && !self
+                        .modules
+                        .borrow()
+                        .get(module_path)?
+                        .scope
+                        .bindings
+                        .contains_key(&base[0])
+                {
+                    members.push(TypeMember::Generic {
+                        name: base[0].clone(),
+                        key: generic_key(module_path, expr),
+                    });
+                    return Some(false);
+                }
+                let Callee::External(name) = self.find_callee(module_path, None, &base, depth)?
+                else {
+                    return None;
+                };
+                if LITERAL_TYPES.contains(&name.as_str()) {
+                    members.push(TypeMember::Literal(self.literal_type_values(
+                        module_path,
+                        expr,
+                        depth,
+                    )?));
+                    return Some(true);
+                }
+                let typing_name = name
+                    .strip_prefix("typing.")
+                    .or_else(|| name.strip_prefix("typing_extensions."))?;
+                match (typing_name, subscript.slice.as_ref()) {
+                    ("Optional", Expr::Tuple(_)) => return None,
+                    ("Optional", member) => {
+                        self.collect_type_members(module_path, member, depth, members)?;
+                        members.push(TypeMember::None);
+                    }
+                    ("Union", Expr::Tuple(tuple)) => {
+                        for member in &tuple.elts {
+                            self.collect_type_members(module_path, member, depth, members)?;
+                        }
+                    }
+                    ("Union", member) => {
+                        self.collect_type_members(module_path, member, depth, members)?;
+                    }
+                    (generic, _) if TYPING_GENERICS.contains(&generic) => {
+                        members.push(TypeMember::Generic {
+                            name: generic.to_string(),
+                            key: generic_key(module_path, expr),
+                        });
+                    }
+                    _ => return None,
+                }
+                Some(true)
+            }
+            Expr::Name(_) | Expr::Attribute(_) => {
+                let path = expr_segments(expr)?;
+                if let Some((alias_module, alias)) = self.find_alias(module_path, &path, depth) {
+                    if matches!(
+                        alias,
+                        Expr::Name(_) | Expr::Attribute(_) | Expr::Subscript(_) | Expr::BinOp(_)
+                    ) {
+                        return self.collect_type_members(
+                            &alias_module,
+                            &alias,
+                            depth + 1,
+                            members,
+                        );
+                    }
+                    return None;
+                }
+                let pending = {
+                    let modules = self.modules.borrow();
+                    pending_value(expr, &modules.get(module_path)?.names, &LocalValues::new())?
+                };
+                match self.resolve_pending(module_path, None, &pending, depth)? {
+                    LiteralValue::Named(name) => {
+                        let key = match self.find_callee(module_path, None, &path, depth) {
+                            Some(Callee::Class { module, path }) => {
+                                format!("{}:{}", module.join("."), path.join("."))
+                            }
+                            Some(Callee::External(qualified)) => qualified,
+                            None => format!("{}:{}", module_path.join("."), path.join(".")),
+                        };
+                        members.push(TypeMember::Class { name, key });
+                        Some(false)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Constructor parameters of a record class, with the module each was declared in.
+    /// A dataclass extends its base's fields; a redefined field keeps the base's position.
+    fn record_params(
+        &self,
+        module: &[String],
+        path: &[String],
+        depth: usize,
+    ) -> Option<Vec<(Vec<String>, RecordParam)>> {
+        if depth > MAX_IMPORT_DEPTH {
+            return None;
+        }
+        let class_module = Rc::clone(self.modules.borrow().get(module)?);
+        let shape = class_scope(&class_module.scope, path)?.record.as_ref()?;
+        let mut params = match &shape.base {
+            None => Vec::new(),
+            Some(base) => {
+                let enclosing = match path {
+                    [.., outer, _] => Some(outer.as_str()),
+                    _ => None,
+                };
+                let Callee::Class {
+                    module: base_module,
+                    path: base_path,
+                } = self.find_callee(module, enclosing, base, depth + 1)?
+                else {
+                    return None;
+                };
+                let base_class = Rc::clone(self.modules.borrow().get(&base_module)?);
+                if !class_scope(&base_class.scope, &base_path)?
+                    .record
+                    .as_ref()?
+                    .dataclass
+                {
+                    return None;
+                }
+                self.record_params(&base_module, &base_path, depth + 1)?
+            }
+        };
+        for param in &shape.params {
+            let declared = (module.to_vec(), param.clone());
+            match params
+                .iter_mut()
+                .find(|(_, existing)| existing.name == param.name)
+            {
+                Some(existing) => *existing = declared,
+                None => params.push(declared),
+            }
+        }
+        Some(params)
+    }
+
+    /// The value of a parameterless call to a function that only returns an expression,
+    /// evaluated in the function's own module.
+    fn call_return_value(
         &self,
         module_path: &[String],
         enclosing_class: Option<&str>,
         callee: &[String],
         depth: usize,
-    ) -> bool {
-        if self.literal_values_functions.is_empty() {
-            return false;
+    ) -> Option<LiteralValue> {
+        if depth > MAX_IMPORT_DEPTH {
+            return None;
         }
-        let qualified = match callee.split_last() {
+        let (module, scope_path, name) = match callee.split_last()? {
+            (method, owner) if !owner.is_empty() => {
+                match self.find_callee(module_path, enclosing_class, owner, depth)? {
+                    Callee::Class { module, path } => (module, path, method.clone()),
+                    Callee::External(_) => return None,
+                }
+            }
+            (name, _) => self.function_definition(module_path, enclosing_class, name, depth)?,
+        };
+        let pending = {
+            let loaded = Rc::clone(self.modules.borrow().get(&module)?);
+            let scope = class_scope(&loaded.scope, &scope_path)?;
+            let body = scope.return_values.get(&name)?.as_ref()?;
+            let locals: LocalValues = body
+                .class_parameter
+                .iter()
+                .map(|parameter| (parameter.clone(), LiteralValue::Opaque))
+                .collect();
+            pending_value(&body.value, &loaded.names, &locals)?
+        };
+        self.resolve_pending(&module, None, &pending, depth + 1)
+    }
+
+    /// Where a called name is defined: its module, enclosing class path and name.
+    fn function_definition(
+        &self,
+        module_path: &[String],
+        enclosing_class: Option<&str>,
+        name: &str,
+        depth: usize,
+    ) -> Option<(Vec<String>, Vec<String>, String)> {
+        if depth > MAX_IMPORT_DEPTH {
+            return None;
+        }
+        let module = Rc::clone(self.modules.borrow().get(module_path)?);
+        if let Some(class_name) = enclosing_class {
+            let class = module.scope.children.get(class_name)?;
+            if class.defined_functions.contains(name) {
+                return Some((
+                    module_path.to_vec(),
+                    vec![class_name.to_string()],
+                    name.to_string(),
+                ));
+            }
+            if class.bindings.contains_key(name) || class.children.contains_key(name) {
+                return None;
+            }
+        }
+        if module.scope.defined_functions.contains(name) {
+            return Some((module_path.to_vec(), Vec::new(), name.to_string()));
+        }
+        if module.scope.bindings.contains_key(name) || module.scope.children.contains_key(name) {
+            return None;
+        }
+        let import = module.imports.get(name)?;
+        let imported = import.imported_name.clone()?;
+        self.ensure_loaded(&import.module_path, depth + 1);
+        if !self.modules.borrow().contains_key(&import.module_path) {
+            return None;
+        }
+        self.function_definition(&import.module_path, None, &imported, depth + 1)
+    }
+
+    /// The qualified name a configured function list would use for `callee`.
+    fn qualified_callee(
+        &self,
+        module_path: &[String],
+        enclosing_class: Option<&str>,
+        callee: &[String],
+        depth: usize,
+    ) -> Option<String> {
+        Some(match callee.split_last() {
             Some((method, owner)) if !owner.is_empty() => {
-                match self.find_callee(module_path, enclosing_class, owner, depth) {
-                    Some(Callee::Class { module, path }) => module
+                match self.find_callee(module_path, enclosing_class, owner, depth)? {
+                    Callee::Class { module, path } => module
                         .iter()
                         .chain(&path)
                         .chain(std::iter::once(method))
                         .cloned()
                         .collect::<Vec<_>>()
                         .join("."),
-                    Some(Callee::External(name)) => format!("{name}.{method}"),
-                    None => return false,
+                    Callee::External(name) => format!("{name}.{method}"),
                 }
             }
             _ => match self.find_callee(module_path, enclosing_class, callee, depth) {
                 Some(Callee::External(name)) => name,
-                _ => match self.function_module(module_path, callee, depth) {
-                    Some(name) => name,
-                    None => return false,
-                },
+                _ => self.function_module(module_path, callee, depth)?,
             },
-        };
-        self.literal_values_functions.contains(&qualified)
+        })
     }
 
     /// The qualified name of a module-level function, following `from x import f`.
@@ -2310,10 +3137,124 @@ impl ConstantResolver {
                 otherwise,
             } => self
                 .construct_record(module_path, enclosing_class, callee, args, keywords, depth)
+                .or_else(|| {
+                    if !args.is_empty() || !keywords.is_empty() {
+                        return None;
+                    }
+                    self.call_return_value(module_path, enclosing_class, callee, depth)
+                })
                 .or_else(|| resolve(otherwise.as_deref()?)),
+            PendingValue::Comprehension {
+                elt,
+                generators,
+                locals,
+            } => {
+                let evaluate = |expr: &Expr, scope: &LocalValues| {
+                    let pending = {
+                        let modules = self.modules.borrow();
+                        pending_value(expr, &modules.get(module_path)?.names, scope)?
+                    };
+                    self.resolve_pending(module_path, enclosing_class, &pending, depth)
+                };
+                let mut values = Vec::new();
+                super::cases::eval_generators(elt, generators, &evaluate, locals, &mut values)?;
+                Some(LiteralValue::Sequence(values))
+            }
+            PendingValue::Generic {
+                base,
+                builtin,
+                args,
+                index,
+            } => {
+                if let Some(builtin) = builtin {
+                    return Some(LiteralValue::Named((*builtin).into()));
+                }
+                if let Some(Callee::External(name)) =
+                    self.find_callee(module_path, enclosing_class, base, depth)
+                {
+                    let typing_name = name
+                        .strip_prefix("typing.")
+                        .or_else(|| name.strip_prefix("typing_extensions."));
+                    if let Some(typing_name) = typing_name {
+                        return self
+                            .typing_alias_name(
+                                module_path,
+                                enclosing_class,
+                                typing_name,
+                                args,
+                                depth,
+                            )
+                            .map(LiteralValue::Named);
+                    }
+                }
+                resolve(index.as_deref()?)
+            }
+            PendingValue::Enumerate { source, start } => {
+                let items = match resolve(source)? {
+                    LiteralValue::Sequence(items) => items,
+                    LiteralValue::Mapping(entries) => {
+                        entries.into_iter().map(|(key, _)| key).collect()
+                    }
+                    _ => return None,
+                };
+                let mut values = Vec::with_capacity(items.len());
+                for (offset, item) in items.into_iter().enumerate() {
+                    let index = start.checked_add(i64::try_from(offset).ok()?)?;
+                    values.push(LiteralValue::Sequence(vec![LiteralValue::Int(index), item]));
+                }
+                Some(LiteralValue::Sequence(values))
+            }
+            PendingValue::Zip { sources, strict } => {
+                let mut columns = Vec::with_capacity(sources.len());
+                for source in sources {
+                    columns.push(match resolve(source)? {
+                        LiteralValue::Sequence(items) => items,
+                        LiteralValue::Mapping(entries) => {
+                            entries.into_iter().map(|(key, _)| key).collect()
+                        }
+                        _ => return None,
+                    });
+                }
+                let len = columns.iter().map(Vec::len).min().unwrap_or(0);
+                if *strict && columns.iter().any(|column| column.len() != len) {
+                    return None;
+                }
+                let mut columns: Vec<_> = columns.into_iter().map(Vec::into_iter).collect();
+                Some(LiteralValue::Sequence(
+                    (0..len)
+                        .map(|_| {
+                            LiteralValue::Sequence(
+                                columns.iter_mut().filter_map(Iterator::next).collect(),
+                            )
+                        })
+                        .collect(),
+                ))
+            }
+            PendingValue::SetOf(source) => {
+                let items = match resolve(source) {
+                    Some(LiteralValue::Sequence(items) | LiteralValue::Set(items)) => items,
+                    Some(LiteralValue::Mapping(entries)) => {
+                        entries.into_iter().map(|(key, _)| key).collect()
+                    }
+                    _ => return Some(LiteralValue::Opaque),
+                };
+                Some(set_value(items).unwrap_or(LiteralValue::Opaque))
+            }
             PendingValue::Mapping(items) => {
                 let mut entries: Vec<(LiteralValue, Option<LiteralValue>)> = Vec::new();
                 for (key, value) in items {
+                    if let PendingValue::Unpack(mapping) = key {
+                        let LiteralValue::Mapping(unpacked) = resolve(mapping)? else {
+                            return None;
+                        };
+                        for (key, value) in unpacked {
+                            match entries.iter_mut().find(|(existing, _)| *existing == key) {
+                                Some(entry) => entry.1 = value,
+                                None => entries.push((key, value)),
+                            }
+                        }
+                        continue;
+                    }
                     let key = resolve(key)?;
                     if matches!(
                         key,
@@ -2336,6 +3277,7 @@ impl ConstantResolver {
             } => {
                 let mut items = match (resolve(source)?, view) {
                     (LiteralValue::Sequence(items), ElementView::Keys) => items,
+                    (LiteralValue::Set(items), ElementView::Keys) if *sorted => items,
                     (LiteralValue::Mapping(entries), ElementView::Keys) => {
                         entries.into_iter().map(|(key, _)| key).collect()
                     }
@@ -2357,6 +3299,11 @@ impl ConstantResolver {
             PendingValue::BinOp(left, op, right) => {
                 super::cases::eval_literal_binop(*op, &resolve(left)?, &resolve(right)?)
             }
+            PendingValue::TypeOr { union, value } => resolve(value).or_else(|| {
+                let mut members = Vec::new();
+                let typing = self.collect_type_members(module_path, union, depth, &mut members)?;
+                union_value(members, typing)
+            }),
             PendingValue::Param { values, id } => Some(LiteralValue::Param {
                 values: values.iter().map(resolve).collect::<Option<_>>()?,
                 id: id.clone(),
@@ -2372,15 +3319,26 @@ impl ConstantResolver {
                 self.literal_type_values(module_path, argument, depth)
                     .map(LiteralValue::Sequence)
             }
-            PendingValue::LiteralValuesCall {
+            PendingValue::ConfiguredCall {
                 callee,
                 argument,
+                argument_value,
+                single_argument,
                 otherwise,
             } => {
-                if self.is_literal_values_function(module_path, enclosing_class, callee, depth) {
-                    return self
-                        .union_literal_values(module_path, argument, depth)
-                        .map(LiteralValue::Sequence);
+                let qualified = (!self.literal_values_functions.is_empty()
+                    || !self.passthrough_functions.is_empty())
+                .then(|| self.qualified_callee(module_path, enclosing_class, callee, depth))
+                .flatten();
+                if let Some(qualified) = qualified {
+                    if *single_argument && self.literal_values_functions.contains(&qualified) {
+                        return self
+                            .union_literal_values(module_path, argument, depth)
+                            .map(LiteralValue::Sequence);
+                    }
+                    if self.passthrough_functions.contains(&qualified) {
+                        return resolve(argument_value.as_deref()?);
+                    }
                 }
                 resolve(otherwise.as_deref()?)
             }
@@ -2490,7 +3448,8 @@ impl ConstantResolver {
                 _ => None,
             };
             if let Some(pending) = pending {
-                let value = self.resolve_pending(module_path, None, &pending, depth + 1)?;
+                let enclosing = outer.is_empty().then_some(*class_name);
+                let value = self.resolve_pending(module_path, enclosing, &pending, depth + 1)?;
                 *binding.value.borrow_mut() = BindingValue::Known(value);
             }
             let value = binding.known_value()?;
@@ -2542,6 +3501,8 @@ impl ConstantResolver {
 
 struct PendingAssignment<'a> {
     module_path: &'a [String],
+    /// The top-level class whose body holds the assignment; its names shadow globals.
+    enclosing_class: Option<&'a str>,
     value: &'a RefCell<BindingValue>,
     pending: Rc<PendingValue>,
 }
@@ -2601,6 +3562,7 @@ fn collect_imports(module: &ModModule, context: &[String]) -> HashMap<String, Im
                         ImportBinding {
                             module_path: module_path.clone(),
                             imported_name: Some(imported_name),
+                            submodules: Vec::new(),
                         },
                     );
                 }
@@ -2614,16 +3576,26 @@ fn collect_imports(module: &ModModule, context: &[String]) -> HashMap<String, Im
                             ImportBinding {
                                 module_path: parts,
                                 imported_name: None,
+                                submodules: Vec::new(),
                             },
                         );
                     } else if let Some(first) = parts.first() {
-                        imports.insert(
-                            first.clone(),
-                            ImportBinding {
+                        let binding = imports.entry(first.clone()).or_insert(ImportBinding {
+                            module_path: vec![first.clone()],
+                            imported_name: None,
+                            submodules: Vec::new(),
+                        });
+                        if binding.imported_name.is_some() || binding.module_path != [first.clone()]
+                        {
+                            *binding = ImportBinding {
                                 module_path: vec![first.clone()],
                                 imported_name: None,
-                            },
-                        );
+                                submodules: Vec::new(),
+                            };
+                        }
+                        if parts.len() > 1 {
+                            binding.submodules.push(parts);
+                        }
                     }
                 }
             }

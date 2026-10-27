@@ -38,6 +38,8 @@ pub fn collect_tests_rust(
         crate::config::read_parametrize_wrappers(&session.rootpath);
     session.config.literal_values_functions =
         crate::config::read_literal_values_functions(&session.rootpath);
+    session.config.passthrough_functions =
+        crate::config::read_passthrough_functions(&session.rootpath);
     let mut collection_errors = CollectionErrors {
         errors: Vec::new(),
         warnings: Vec::new(),

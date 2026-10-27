@@ -131,6 +131,16 @@ fn strict_ids_in_table(table: &Value) -> bool {
 /// Read `[tool.rtest] literal-values-functions` from `pyproject.toml`: qualified names of
 /// functions that return the values of a `Literal` type (or a union of them) like `get_args`.
 pub fn read_literal_values_functions(root_path: &Path) -> Vec<String> {
+    read_function_list(root_path, "literal-values-functions")
+}
+
+/// Read `[tool.rtest] passthrough-functions` from `pyproject.toml`: qualified names of
+/// functions that return their first argument unchanged, such as validators.
+pub fn read_passthrough_functions(root_path: &Path) -> Vec<String> {
+    read_function_list(root_path, "passthrough-functions")
+}
+
+fn read_function_list(root_path: &Path, key: &str) -> Vec<String> {
     std::fs::read_to_string(root_path.join("pyproject.toml"))
         .ok()
         .and_then(|text| toml::from_str::<Value>(&text).ok())
@@ -138,7 +148,7 @@ pub fn read_literal_values_functions(root_path: &Path) -> Vec<String> {
             toml_value
                 .get("tool")?
                 .get("rtest")?
-                .get("literal-values-functions")?
+                .get(key)?
                 .as_array()
                 .map(|items| {
                     items

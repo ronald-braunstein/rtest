@@ -38,6 +38,9 @@ pub enum LiteralValue {
     /// An instance of a plain record class (see the resolver's record shapes) with the
     /// attributes its constructor sets, when known. Pytest IDs it positionally.
     Record(Vec<(String, Option<LiteralValue>)>),
+    /// A `set` or `frozenset` of hashable scalars, deduplicated in source order. Its
+    /// iteration order depends on hashing, so it is only expanded through `sorted()`.
+    Set(Vec<LiteralValue>),
 }
 
 /// Specification for a single `@cases` or `@parametrize` decorator.
@@ -561,11 +564,20 @@ impl CaseId {
             LiteralValue::Opaque
             | LiteralValue::Mapping(_)
             | LiteralValue::Param { .. }
-            | LiteralValue::Record(_) => Self::Positional,
+            | LiteralValue::Record(_)
+            | LiteralValue::Set(_) => Self::Positional,
             LiteralValue::Sequence(values) => {
                 Self::Parts(values.iter().map(Self::from_literal).collect())
             }
             _ => Self::Value(literal_to_id_string(value)),
+        }
+    }
+
+    /// The ID of one parameter's value: pytest IDs a list or tuple value positionally.
+    fn component(self) -> Self {
+        match self {
+            Self::Parts(_) => Self::Positional,
+            id => id,
         }
     }
 
@@ -704,34 +716,31 @@ fn eval_comprehension(
     resolver: &ConstantResolver,
     enclosing_class: Option<&str>,
 ) -> Option<LiteralValue> {
+    let evaluate =
+        |expr: &Expr, locals: &LocalValues| resolver.resolve_expr(enclosing_class, expr, locals);
     let mut values = Vec::new();
-    eval_generators(
-        elt,
-        generators,
-        resolver,
-        enclosing_class,
-        &LocalValues::new(),
-        &mut values,
-    )?;
+    eval_generators(elt, generators, &evaluate, &LocalValues::new(), &mut values)?;
     Some(LiteralValue::Sequence(values))
 }
 
-fn eval_generators(
+/// Evaluates expressions with comprehension variables bound in `locals`.
+pub(crate) type Evaluate<'a> = dyn Fn(&Expr, &LocalValues) -> Option<LiteralValue> + 'a;
+
+pub(crate) fn eval_generators(
     elt: &Expr,
     generators: &[ruff_python_ast::Comprehension],
-    resolver: &ConstantResolver,
-    enclosing_class: Option<&str>,
+    evaluate: &Evaluate,
     locals: &LocalValues,
     values: &mut Vec<LiteralValue>,
 ) -> Option<()> {
     let Some((generator, rest)) = generators.split_first() else {
-        values.push(resolver.resolve_expr(enclosing_class, elt, locals)?);
+        values.push(evaluate(elt, locals)?);
         return (values.len() <= MAX_COMPREHENSION_LEN).then_some(());
     };
     if generator.is_async {
         return None;
     }
-    let items = match resolver.resolve_expr(enclosing_class, &generator.iter, locals)? {
+    let items = match evaluate(&generator.iter, locals)? {
         LiteralValue::Sequence(items) => items,
         LiteralValue::Mapping(entries) => entries.into_iter().map(|(key, _)| key).collect(),
         _ => return None,
@@ -741,10 +750,10 @@ fn eval_generators(
         bind_target(&generator.target, item, &mut scope)?;
         let mut keep = true;
         for condition in &generator.ifs {
-            keep &= eval_condition(condition, resolver, enclosing_class, &scope)?;
+            keep &= eval_condition(condition, evaluate, &scope)?;
         }
         if keep {
-            eval_generators(elt, rest, resolver, enclosing_class, &scope, values)?;
+            eval_generators(elt, rest, evaluate, &scope, values)?;
         }
     }
     Some(())
@@ -768,20 +777,15 @@ fn bind_target(target: &Expr, value: LiteralValue, locals: &mut LocalValues) -> 
 }
 
 /// Evaluate a comprehension filter; `None` when Python's result cannot be known statically.
-fn eval_condition(
-    expr: &Expr,
-    resolver: &ConstantResolver,
-    enclosing_class: Option<&str>,
-    locals: &LocalValues,
-) -> Option<bool> {
+fn eval_condition(expr: &Expr, evaluate: &Evaluate, locals: &LocalValues) -> Option<bool> {
     use ruff_python_ast::{BoolOp, CmpOp, UnaryOp};
-    let resolve = |expr: &Expr| resolver.resolve_expr(enclosing_class, expr, locals);
+    let resolve = |expr: &Expr| evaluate(expr, locals);
     match expr {
         Expr::BoolOp(bool_op) => {
             let results = bool_op
                 .values
                 .iter()
-                .map(|value| eval_condition(value, resolver, enclosing_class, locals))
+                .map(|value| eval_condition(value, evaluate, locals))
                 .collect::<Option<Vec<_>>>()?;
             Some(match bool_op.op {
                 BoolOp::And => results.iter().all(|r| *r),
@@ -789,7 +793,7 @@ fn eval_condition(
             })
         }
         Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
-            eval_condition(&unary.operand, resolver, enclosing_class, locals).map(|r| !r)
+            eval_condition(&unary.operand, evaluate, locals).map(|r| !r)
         }
         Expr::Compare(compare) => {
             let ([op], [left, right]) = (compare.ops.as_ref(), compare.operands.as_ref()) else {
@@ -801,7 +805,7 @@ fn eval_condition(
                 CmpOp::NotEq => literals_equal(&left, &right).map(|r| !r),
                 CmpOp::In | CmpOp::NotIn => {
                     let items = match right {
-                        LiteralValue::Sequence(items) => items,
+                        LiteralValue::Sequence(items) | LiteralValue::Set(items) => items,
                         LiteralValue::Mapping(entries) => {
                             entries.into_iter().map(|(key, _)| key).collect()
                         }
@@ -816,7 +820,16 @@ fn eval_condition(
                 _ => None,
             }
         }
-        _ => None,
+        expr => match resolve(expr)? {
+            LiteralValue::Bool(value) => Some(value),
+            LiteralValue::Int(value) => Some(value != 0),
+            LiteralValue::String(value) => Some(!value.is_empty()),
+            LiteralValue::None => Some(false),
+            LiteralValue::Sequence(items) | LiteralValue::Set(items) => Some(!items.is_empty()),
+            LiteralValue::Mapping(entries) => Some(!entries.is_empty()),
+            // Objects may define `__bool__` or `__len__`.
+            _ => None,
+        },
     }
 }
 
@@ -840,8 +853,24 @@ fn literals_equal(left: &LiteralValue, right: &LiteralValue) -> Option<bool> {
             }
             Some(equal)
         }
-        (V::Opaque | V::Mapping(_) | V::Param { .. } | V::EnumMember(_) | V::Float(_), _)
-        | (_, V::Opaque | V::Mapping(_) | V::Param { .. } | V::EnumMember(_) | V::Float(_))
+        (
+            V::Opaque
+            | V::Mapping(_)
+            | V::Set(_)
+            | V::Param { .. }
+            | V::EnumMember(_)
+            | V::Float(_),
+            _,
+        )
+        | (
+            _,
+            V::Opaque
+            | V::Mapping(_)
+            | V::Set(_)
+            | V::Param { .. }
+            | V::EnumMember(_)
+            | V::Float(_),
+        )
         | (V::Int(_) | V::Bool(_), V::Int(_) | V::Bool(_)) => None,
         _ => Some(false),
     }
@@ -857,14 +886,26 @@ fn extract_pytest_case(
 ) -> Result<String, CannotExpandReason> {
     // Sequence-form argnames unpack rows even for one argument. String "x"
     // keeps a list/tuple row as the value; both forms share the component logic.
-    let (_, id) = match sequence_elts(elt).filter(|_| argnames.unpack_rows) {
-        Some(components) => extract_literal_sequence(
-            components,
-            resolver,
-            enclosing_class,
-            ParamIdStyle::RuntimeValue,
-        )?,
-        None => extract_literal(elt, resolver, enclosing_class, ParamIdStyle::RuntimeValue)?,
+    let id = match sequence_elts(elt).filter(|_| argnames.unpack_rows) {
+        Some(components) => {
+            extract_literal_sequence(
+                components,
+                resolver,
+                enclosing_class,
+                ParamIdStyle::RuntimeValue,
+            )?
+            .1
+        }
+        None => {
+            let (_, id) =
+                extract_literal(elt, resolver, enclosing_class, ParamIdStyle::RuntimeValue)?;
+            match id {
+                CaseId::Parts(parts) if argnames.unpack_rows => {
+                    CaseId::Parts(parts.into_iter().map(CaseId::component).collect())
+                }
+                id => id.component(),
+            }
+        }
     };
     Ok(id.render(argnames, idx, 0))
 }
@@ -959,7 +1000,8 @@ fn id_for_resolved_case_value(
             | LiteralValue::Opaque
             | LiteralValue::Mapping(_)
             | LiteralValue::Param { .. }
-            | LiteralValue::Record(_) => format!("{}{}", argnames.name(i), idx),
+            | LiteralValue::Record(_)
+            | LiteralValue::Set(_) => format!("{}{}", argnames.name(i), idx),
             _ => literal_to_id_string(part),
         })
         .collect::<Vec<_>>()
@@ -1013,9 +1055,10 @@ fn call_func(expr: &Expr) -> &Expr {
 /// A single parametrize value: pytest IDs list, tuple, and dict objects positionally.
 fn element_value(value: LiteralValue) -> (LiteralValue, CaseId) {
     match value {
-        LiteralValue::Sequence(_) | LiteralValue::Mapping(_) | LiteralValue::Param { .. } => {
-            (LiteralValue::Opaque, CaseId::Positional)
-        }
+        LiteralValue::Sequence(_)
+        | LiteralValue::Mapping(_)
+        | LiteralValue::Set(_)
+        | LiteralValue::Param { .. } => (LiteralValue::Opaque, CaseId::Positional),
         value => {
             let id = CaseId::from_literal(&value);
             (value, id)
@@ -1148,7 +1191,13 @@ fn extract_literal_sequence(
 ) -> Result<(LiteralValue, CaseId), CannotExpandReason> {
     let (values, ids) = expressions
         .iter()
-        .map(|expr| extract_literal(expr, resolver, enclosing_class, id_style))
+        .map(|expr| {
+            let (value, id) = extract_literal(expr, resolver, enclosing_class, id_style)?;
+            Ok(match id_style {
+                ParamIdStyle::RuntimeValue => (value, id.component()),
+                ParamIdStyle::SourcePath => (value, id),
+            })
+        })
         .collect::<Result<(Vec<_>, Vec<_>), _>>()?;
     Ok((LiteralValue::Sequence(values), CaseId::Parts(ids)))
 }
@@ -1290,6 +1339,7 @@ fn extract_ids_kwarg(
             | LiteralValue::Mapping(_)
             | LiteralValue::Param { .. }
             | LiteralValue::Record(_)
+            | LiteralValue::Set(_)
             | LiteralValue::Named(_) => Err(invalid()),
             _ => Ok(literal_to_id_string(id)),
         })
@@ -1313,7 +1363,8 @@ pub fn literal_to_id_string(value: &LiteralValue) -> String {
         LiteralValue::Opaque
         | LiteralValue::Mapping(_)
         | LiteralValue::Param { .. }
-        | LiteralValue::Record(_) => String::new(),
+        | LiteralValue::Record(_)
+        | LiteralValue::Set(_) => String::new(),
         LiteralValue::EnumMember(id) | LiteralValue::Named(id) => id.clone(),
     }
 }

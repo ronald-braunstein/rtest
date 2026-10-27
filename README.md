@@ -162,11 +162,36 @@ Both `LiteralTools.values(Color)` and `LiteralTools[Color].values(Color)` resolv
 de-duplication and union members that are equal as types are dropped, matching `typing.get_args`; a union member
 that is not a `Literal` of strings falls back to pytest.
 
+#### Pass-through helpers
+
+Functions that validate their first argument and return it unchanged can be listed by qualified name, so a call
+resolves to that argument:
+
+```toml
+[tool.rtest]
+passthrough-functions = ["myproject.validation.check_values", "graphql_lib.gql"]
+```
+
+#### Functions, comprehensions and types
+
+- A function or `@staticmethod`/`@classmethod` without parameters whose body is a single `return` (after an
+  optional docstring) resolves to the returned expression, evaluated in its defining module.
+- Comprehensions, `set`/`frozenset` literals and calls, `sorted(...)`, `enumerate(...)`, `zip(...)` and `{**a, ...}`
+  evaluate over static values. A set must be sorted before it is used as argvalues, since its iteration order is
+  only known at runtime.
+- Classes reached through a module (`import pkg.mod`, `import pkg.mod as m`, `from pkg import mod`) ID by
+  `__name__`, as do subscripted types: `list[int]` is `list`, `Optional[int]` is `Optional`, a `Literal[...]` is
+  `Literal`, and a union of distinct members is `Union` (Python drops duplicate members first, so
+  `Union[int, int]` is `int`). `int | None` has no `__name__` and is IDed positionally.
+- `float("nan")` and other plain numeric strings, `http.HTTPStatus` members and `pytest.ExitCode` members (both
+  `IntEnum`s, IDed by their integer value) resolve to their values.
+
 #### Records and IDs
 
 Instances of plain record classes are counted statically and IDed positionally, and their attributes can feed IDs
 (`ids=lambda case: case.name` or `ids=[case.name for case in CASES]`). A record class is a `@dataclass` without
-`__init__`, `__post_init__` or base classes, a `NamedTuple`, or a class whose `__init__` only assigns parameters to
+`__init__` or `__post_init__` whose only base is another such dataclass (`Generic[T]` aside), a `NamedTuple`,
+or a class whose `__init__` only assigns parameters to
 `self` attributes. Names reached through `from module import *` follow a static `__all__` (or the module's public
 names when it has none), and nested classes resolve members through dotted bases such as
 `class Status(Enums.Status): pass`.
