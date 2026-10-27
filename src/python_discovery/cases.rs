@@ -917,6 +917,9 @@ fn extract_unresolved_literal(
         // Dicts and sets are IDed positionally; other expressions may evaluate to values
         // pytest IDs by value.
         Expr::Dict(_) | Expr::Set(_) => LiteralValue::Opaque,
+        Expr::FString(_) | Expr::TString(_) if id_style == ParamIdStyle::RuntimeValue => {
+            return Err(CannotExpandReason::UnsupportedExpression("f-string".into()))
+        }
         _ if id_style == ParamIdStyle::RuntimeValue => {
             return Err(CannotExpandReason::UnsupportedExpression(
                 "expression evaluated at runtime".into(),
