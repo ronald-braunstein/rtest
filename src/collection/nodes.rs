@@ -178,6 +178,7 @@ impl CollectionBranch {
             duplicate_ids: session.config.duplicate_ids,
             parametrize_wrappers: session.config.parametrize_wrappers.clone(),
             literal_values_functions: session.config.literal_values_functions.clone(),
+            passthrough_functions: session.config.passthrough_functions.clone(),
         };
 
         // Use the session's root path for module resolution

@@ -2178,7 +2178,7 @@ class TestCollectionIntegration(unittest.TestCase):
                 from other import SHADOWED
                 from enum import Enum
                 class Color(Enum): RED = 1
-                def get_data(): return [7]
+                def get_data(value=7): return [value]
                 DATA = [1]
                 DATA = get_data()
                 COLORS = [Color.RED]
@@ -2189,8 +2189,8 @@ class TestCollectionIntegration(unittest.TestCase):
                 import pytest
                 from constants import DATA, COLORS, SHADOWED
 
-                def get_data():
-                    return [1, 2, 3]
+                def get_data(stop=4):
+                    return list(range(1, stop))
 
                 @pytest.mark.parametrize("value", get_data())
                 def test_call(value):

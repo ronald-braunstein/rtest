@@ -16,6 +16,7 @@ pub struct CollectionConfig {
     pub duplicate_ids: DuplicateIds,
     pub parametrize_wrappers: Vec<ParametrizeWrapper>,
     pub literal_values_functions: Vec<String>,
+    pub passthrough_functions: Vec<String>,
 }
 
 impl Default for CollectionConfig {
@@ -40,6 +41,7 @@ impl Default for CollectionConfig {
             duplicate_ids: DuplicateIds::default(),
             parametrize_wrappers: vec![],
             literal_values_functions: vec![],
+            passthrough_functions: vec![],
         }
     }
 }

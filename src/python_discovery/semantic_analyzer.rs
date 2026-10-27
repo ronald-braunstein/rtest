@@ -112,7 +112,8 @@ impl SemanticTestDiscovery {
             module_resolver.clone(),
             path,
         )
-        .with_literal_values_functions(&self.config.literal_values_functions);
+        .with_literal_values_functions(&self.config.literal_values_functions)
+        .with_passthrough_functions(&self.config.passthrough_functions);
 
         // First pass: collect imports
         let imports = self.collect_imports(&ast_module);

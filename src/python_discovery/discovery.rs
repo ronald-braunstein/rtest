@@ -61,6 +61,8 @@ pub struct TestDiscoveryConfig {
     /// Qualified functions that return a `Literal` type's values like `typing.get_args`,
     /// also flattening unions of `Literal` types.
     pub literal_values_functions: Vec<String>,
+    /// Qualified functions that return their first argument unchanged.
+    pub passthrough_functions: Vec<String>,
 }
 
 impl Default for TestDiscoveryConfig {
@@ -71,6 +73,7 @@ impl Default for TestDiscoveryConfig {
             duplicate_ids: DuplicateIds::default(),
             parametrize_wrappers: Vec::new(),
             literal_values_functions: Vec::new(),
+            passthrough_functions: Vec::new(),
         }
     }
 }

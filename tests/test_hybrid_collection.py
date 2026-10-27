@@ -236,7 +236,7 @@ def test_hybrid_collection_matches_pytest() -> None:
             import pytest
             @pytest.mark.parametrize("x,y", [(str(1), str(2))])
             def test_helper_calls(x, y): pass
-            def make_row(): return (1, 2)
+            def make_row(x=1): return (x, 2)
             @pytest.mark.parametrize("x,y", [make_row()], ids=["row"])
             def test_opaque_row(x, y): pass
             @pytest.mark.parametrize("value", [1, 2], ids=[None, "named"])
@@ -276,7 +276,7 @@ def test_hybrid_collection_matches_pytest() -> None:
                 ("fstring_repr", "NAME = 'n'", '[f"{NAME!r}"]'),
                 ("conditional", "ONE = 1", '["a" if ONE else "b"]'),
                 ("fstring_runtime", "import os", '[f"{os.sep}x"]'),
-                ("fstring_call", "def name(): return 'n'", '[f"{name()}"]'),
+                ("fstring_call", "def name(n='n'): return n", '[f"{name()}"]'),
                 ("comparison", "ONE = 1", "[ONE == 1]"),
                 (
                     "value_return",
@@ -416,7 +416,7 @@ def test_parametrize_wrapper_matches_pytest() -> None:
         """,
         "test_runtime_wrapper.py": """
             from helpers.params import Params, parametrize
-            def make_id(): return "made"
+            def make_id(made="made"): return made
             CASES = [Params(id="a")]
             @parametrize(["id"], [Params(id=make_id())])
             def test_call_id(p): pass
@@ -477,8 +477,8 @@ def test_dict_items_match_pytest() -> None:
         """,
         "test_runtime_items.py": """
             import pytest
-            def helper(): return 1
-            def make_mapping(): return {"a": 1}
+            def helper(n=1): return n
+            def make_mapping(a=1): return {"a": a}
             RUNTIME = {"a": helper(), "b": 2}
             @pytest.mark.parametrize("key,value", RUNTIME.items())
             def test_runtime_value(key, value): pass
@@ -584,6 +584,208 @@ def test_literal_values_functions_match_pytest() -> None:
             {
                 "test_runtime_literals.py::test_non_literal_member",
                 "test_runtime_literals.py::test_unconfigured_function",
+            },
+        )
+
+
+def test_returned_values_and_sets_match_pytest() -> None:
+    files = {
+        "pyproject.toml": """
+            [tool.rtest]
+            passthrough-functions = ["values.Checks.validate"]
+        """,
+        "values.py": """
+            from dataclasses import dataclass
+            from typing import Literal, get_args
+            Env = Literal["local", "dev", "stage", "prod"]
+            class EnvValues:
+                LOCAL = "local"
+                DEV = "dev"
+            class Status:
+                OPEN = "open"
+                DONE = "done"
+                @staticmethod
+                def all_statuses():
+                    "Every status."
+                    return {Status.OPEN, Status.DONE, Status.OPEN}
+                @staticmethod
+                def open_statuses():
+                    return [Status.OPEN]
+            class Checks:
+                @classmethod
+                def validate(cls, values, literal_type):
+                    for value in values:
+                        if value not in get_args(literal_type):
+                            raise ValueError(value)
+                    return list(values)
+            @dataclass(frozen=True)
+            class Config:
+                enabled: bool
+            CONFIG = {"b": Config(True), "a": Config(False), "c": Config(True)}
+            def remote_envs():
+                return (env for env in get_args(Env) if env not in {EnvValues.LOCAL, EnvValues.DEV})
+            def enabled_names():
+                return [name for name, config in CONFIG.items() if config.enabled]
+            def validated():
+                return Checks.validate(["dev", "prod"], Env)
+        """,
+        "test_static_returns.py": """
+            from typing import get_args
+            import pytest
+            from values import Env, Status, enabled_names, remote_envs, validated
+            LOCAL_ONLY = [env for env in get_args(Env) if env == "local"]
+            class TestClassBody:
+                def _cases():
+                    return [1, 2]
+                @pytest.mark.parametrize("value", _cases())
+                def test_class_function(self, value): pass
+            @pytest.mark.parametrize("env", remote_envs())
+            def test_generator_with_set_filter(env): pass
+            @pytest.mark.parametrize("status", sorted(Status.all_statuses()))
+            def test_sorted_set(status): pass
+            @pytest.mark.parametrize("status", Status.open_statuses())
+            def test_static_method(status): pass
+            @pytest.mark.parametrize("name", enabled_names())
+            def test_record_filter(name): pass
+            @pytest.mark.parametrize("name", sorted({n for n in ("b", "a", "b")}))
+            def test_set_comprehension(name): pass
+            @pytest.mark.parametrize("env", validated())
+            def test_passthrough(env): pass
+            @pytest.mark.parametrize("env", LOCAL_ONLY)
+            def test_module_comprehension(env): pass
+            @pytest.mark.parametrize("value", [{1, 2}, frozenset()])
+            def test_set_values(value): pass
+        """,
+        "test_runtime_returns.py": """
+            import pytest
+            from values import Status
+            def twice(): return [1]
+            def twice(): return [2]
+            def with_parameter(n=2): return list(range(n))
+            def two_statements():
+                values = [1]
+                return values
+            @pytest.mark.parametrize("value", twice())
+            def test_redefined(value): pass
+            @pytest.mark.parametrize("value", with_parameter())
+            def test_parameter(value): pass
+            @pytest.mark.parametrize("value", two_statements())
+            def test_statements(value): pass
+            @pytest.mark.parametrize("status", Status.all_statuses())
+            def test_unsorted_set(status): pass
+            @pytest.mark.parametrize("value", sorted({1, True}))
+            def test_mixed_set(value): pass
+        """,
+    }
+    with create_test_project({name: textwrap.dedent(source) for name, source in files.items()}) as root:
+        assert_hybrid_matches_pytest(
+            root,
+            ["test_static_returns.py", "test_runtime_returns.py"],
+            {
+                "test_runtime_returns.py::test_redefined",
+                "test_runtime_returns.py::test_parameter",
+                "test_runtime_returns.py::test_statements",
+                "test_runtime_returns.py::test_unsorted_set",
+                "test_runtime_returns.py::test_mixed_set",
+            },
+        )
+
+
+def test_types_records_and_module_attributes_match_pytest() -> None:
+    files = {
+        "pkg/__init__.py": "",
+        "pkg/types.py": """
+            from dataclasses import dataclass
+            from typing import Generic, Literal, TypeVar
+            T = TypeVar("T")
+            Color = Literal["red", "blue"]
+            Reordered = Literal["blue", "red"]
+            Spooky = Literal["orange", "black"]
+            Palette = Color | Spooky | Literal["white"]
+            class Summary: pass
+            class Detail: pass
+            @dataclass(frozen=True)
+            class Definition(Generic[T]):
+                name: str
+            @dataclass(frozen=True)
+            class Integration(Definition[T], Generic[T]):
+                shapes: tuple
+                label: str = "default"
+            INTEGRATION = Integration(name="first", shapes=("a", "b"))
+        """,
+        "pkg/other.py": """
+            class Summary: pass
+        """,
+        "test_static_types.py": """
+            import http
+            from decimal import Decimal
+            from http import HTTPStatus
+            from typing import List, Optional, Union
+            import pytest
+            import pkg.types
+            import pkg.types as aliased
+            from pkg import types as reporting_types
+            from pkg.types import INTEGRATION, Color, Palette, Reordered, Spooky
+            PAIR = (1, 2)
+            class Grouped:
+                FIRST = "first"
+                BOTH = (FIRST, "second")
+                @pytest.mark.parametrize("name", BOTH)
+                def test_class_body(self, name): pass
+            @pytest.mark.parametrize("cls", [reporting_types.Summary, aliased.Detail, pkg.types.Summary])
+            def test_module_attributes(cls): pass
+            @pytest.mark.parametrize(
+                "kind",
+                [list[str], dict, tuple[int, ...], List[int], Optional[int], Union[str, None],
+                 Union[int, str], Union[int], Optional[list[int]], str | None, int | int],
+            )
+            def test_generic_types(kind): pass
+            @pytest.mark.parametrize(
+                "kind",
+                [Color, Palette, Union[Color, Spooky], Color | Spooky, Union[Color, Reordered],
+                 Color | None, int | Color, list[int] | Color],
+            )
+            def test_literal_unions(kind): pass
+            @pytest.mark.parametrize(
+                "value",
+                [float("nan"), float("-inf"), float(" 1.5 "), float(3), Decimal("1.5"), HTTPStatus.OK,
+                 http.HTTPStatus.NOT_FOUND, pytest.ExitCode.TESTS_FAILED],
+            )
+            def test_scalars(value): pass
+            @pytest.mark.parametrize("shapes, label, name", [(INTEGRATION.shapes, INTEGRATION.label, INTEGRATION.name)])
+            def test_generic_record(shapes, label, name): pass
+            @pytest.mark.parametrize("pair, name", [(PAIR, "a"), pytest.param(PAIR, "b")])
+            def test_sequence_component(pair, name): pass
+            @pytest.mark.parametrize("pair", [PAIR, pytest.param(PAIR)])
+            def test_sequence_value(pair): pass
+            @pytest.mark.parametrize("index, name", enumerate(["a", "b"], start=1))
+            def test_enumerate(index, name): pass
+            @pytest.mark.parametrize("left, right", zip(["a", "b"], [1, 2], strict=True))
+            def test_zip(left, right): pass
+            @pytest.mark.parametrize("key", {**{"b": 1}, "a": 2})
+            def test_dict_unpack(key): pass
+        """,
+        "test_runtime_types.py": """
+            import typing
+            from typing import List, Union
+            import pytest
+            from pkg import other, types
+            @pytest.mark.parametrize("kind", [Union[types.Summary, other.Summary]])
+            def test_same_named_classes(kind): pass
+            @pytest.mark.parametrize("kind", [Union[List[int], typing.List[int]]])
+            def test_generic_spellings(kind): pass
+            @pytest.mark.parametrize("value", [float("1_000")])
+            def test_grouped_float(value): pass
+        """,
+    }
+    with create_test_project({name: textwrap.dedent(source) for name, source in files.items()}) as root:
+        assert_hybrid_matches_pytest(
+            root,
+            ["test_static_types.py", "test_runtime_types.py"],
+            {
+                "test_runtime_types.py::test_same_named_classes",
+                "test_runtime_types.py::test_generic_spellings",
+                "test_runtime_types.py::test_grouped_float",
             },
         )
 
@@ -802,7 +1004,7 @@ def test_record_attribute_ids_match_pytest() -> None:
         "test_runtime_records.py": """
             import pytest
             from records import Case, Checked, Child, Computed
-            def compute(): return "x"
+            def compute(x="x"): return x
             @pytest.mark.parametrize("case", [Checked("a")], ids=lambda case: case.id)
             def test_post_init(case): pass
             @pytest.mark.parametrize("case", [Computed("a")], ids=lambda case: case.label)
@@ -822,7 +1024,6 @@ def test_record_attribute_ids_match_pytest() -> None:
             {
                 "test_runtime_records.py::test_post_init",
                 "test_runtime_records.py::test_computed_init",
-                "test_runtime_records.py::test_inherited",
                 "test_runtime_records.py::test_unknown_field",
                 "test_runtime_records.py::test_object_id",
             },
@@ -832,7 +1033,7 @@ def test_record_attribute_ids_match_pytest() -> None:
 def test_cannot_expand_report_destinations_and_lifecycle() -> None:
     files = {
         "test_dynamic.py": (
-            "import pytest\ndef values(): return [0, 1]\n"
+            "import pytest\ndef values(n=2): return list(range(n))\n"
             "@pytest.mark.parametrize('x', values())\ndef test_collected(x): pass\n"
         ),
         "test_static.py": "def test_static(): pass\n",
