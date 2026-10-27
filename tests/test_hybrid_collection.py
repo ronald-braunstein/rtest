@@ -443,6 +443,68 @@ def test_parametrize_wrapper_matches_pytest() -> None:
         assert sorted(static + fallback) == sorted(pytest_collect(root, test_files))
 
 
+def test_dict_items_match_pytest() -> None:
+    files = {
+        "test_static_items.py": """
+            import enum
+            import pytest
+            class Color(enum.Enum):
+                RED = "r"
+                GREEN = "g"
+            class Holder:
+                LABELS = {"x": "ex", "y": "why"}
+            STRINGS = {"b": "bee", "a": "ay"}
+            LISTS = {"one": [1], "two": [2, 2]}
+            COLORS = {"red": Color.RED, "green": Color.GREEN}
+            NUMBERS = {3: "three", 1: "one", 2: "two"}
+            @pytest.mark.parametrize("pair", STRINGS.items())
+            def test_pairs(pair): pass
+            @pytest.mark.parametrize("key,value", STRINGS.items())
+            def test_string_values(key, value): pass
+            @pytest.mark.parametrize("key,value", LISTS.items())
+            def test_list_values(key, value): pass
+            @pytest.mark.parametrize("key,value", COLORS.items())
+            def test_enum_values(key, value): pass
+            @pytest.mark.parametrize("key,value", sorted(STRINGS.items()))
+            def test_sorted_string_keys(key, value): pass
+            @pytest.mark.parametrize("key,value", sorted(NUMBERS.items()))
+            def test_sorted_int_keys(key, value): pass
+            @pytest.mark.parametrize("key,value", list(Holder.LABELS.items()))
+            def test_class_constant(key, value): pass
+            class TestItems:
+                @pytest.mark.parametrize("key,value", Holder.LABELS.items())
+                def test_method(self, key, value): pass
+        """,
+        "test_runtime_items.py": """
+            import pytest
+            def helper(): return 1
+            def make_mapping(): return {"a": 1}
+            RUNTIME = {"a": helper(), "b": 2}
+            @pytest.mark.parametrize("key,value", RUNTIME.items())
+            def test_runtime_value(key, value): pass
+            @pytest.mark.parametrize("key,value", make_mapping().items())
+            def test_runtime_mapping(key, value): pass
+        """,
+    }
+    with create_test_project({name: textwrap.dedent(source) for name, source in files.items()}) as root:
+        test_files = ["test_static_items.py", "test_runtime_items.py"]
+        report = root / "fallback.txt"
+        version = oracle_pytest_version()
+        result = collect(root, "--cannot-expand-report", str(report), "--pytest-version", version, *test_files)
+        assert result.returncode == 0, result.output
+        reported = {
+            normalize_nodeid(line.removeprefix("rtest-cannot-expand: ")) for line in report.read_text().splitlines()
+        }
+        assert reported == {
+            "test_runtime_items.py::test_runtime_value",
+            "test_runtime_items.py::test_runtime_mapping",
+        }
+        collected = [normalize_nodeid(line) for line in extract_test_lines(result.output_lines)]
+        static = [nodeid for nodeid in collected if nodeid not in reported]
+        fallback = [nodeid for nodeid in pytest_collect(root, test_files) if nodeid.split("[", 1)[0] in reported]
+        assert sorted(static + fallback) == sorted(pytest_collect(root, test_files))
+
+
 def test_cannot_expand_report_destinations_and_lifecycle() -> None:
     files = {
         "test_dynamic.py": (
