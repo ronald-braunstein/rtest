@@ -1959,6 +1959,9 @@ class TestCollectionIntegration(unittest.TestCase):
 
                 @pytest.mark.parametrize("value", [3 % -2, 3 % 2])
                 def test_remainder(value): pass
+
+                @pytest.mark.parametrize("value", [0.5 * 1024 * 1024, 1 / 2, 0.1 + 0.2, 2 * 1.5])
+                def test_float(value): pass
             """),
         }
 
@@ -1974,6 +1977,10 @@ class TestCollectionIntegration(unittest.TestCase):
                     "test_ops.py::test_first[elements0-<lambda>-1]",
                     "test_ops.py::test_floor",
                     "test_ops.py::test_remainder",
+                    "test_ops.py::test_float[524288.0]",
+                    "test_ops.py::test_float[0.5]",
+                    "test_ops.py::test_float[0.30000000000000004]",
+                    "test_ops.py::test_float[3.0]",
                 ],
             )
             for name in ("test_floor", "test_remainder"):

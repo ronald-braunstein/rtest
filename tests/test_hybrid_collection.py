@@ -226,6 +226,8 @@ def test_hybrid_collection_matches_pytest() -> None:
                     pass
                 @pytest.mark.parametrize("value", [_Case()])
                 def test_class_scope(self, value): pass
+            @pytest.mark.parametrize("value", [0.5 * 1024 * 1024, 1 / 2, 1 / 3, 0.1 + 0.2, 2 * 1.5])
+            def test_float_arithmetic(value): pass
         """,
         "test_duplicates.py": """
             import pytest
