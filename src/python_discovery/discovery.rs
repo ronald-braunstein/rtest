@@ -157,6 +157,7 @@ pub fn discover_tests_with_inheritance(
 #[derive(Default)]
 pub(crate) struct DiscoveryCache {
     conftests: HashMap<PathBuf, bool>,
+    module_resolver: Option<ModuleResolver>,
 }
 
 impl DiscoveryCache {
@@ -168,7 +169,10 @@ impl DiscoveryCache {
         root_path: &Path,
     ) -> CollectionResult<(Vec<TestInfo>, Vec<CollectionWarning>)> {
         let module_path = path_to_module_path(path, root_path);
-        let module_resolver = ModuleResolver::new(root_path);
+        let module_resolver = self
+            .module_resolver
+            .get_or_insert_with(|| ModuleResolver::new(root_path))
+            .clone();
         let mut discovery = SemanticTestDiscovery::new(config.clone());
 
         let (mut tests, warnings) =

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Collect module files on one worker thread per CPU; set `RTEST_COLLECT_THREADS` to cap the count. Output order is unchanged.
+- Parse each imported module once per collection run instead of once per test file that imports it.
+- Resolve module-level constants only when a parametrize lookup needs them, so files without parametrized tests no longer load the modules their constants import.
+
 ## [0.0.47] - 2026-10-15
 
 ### Added

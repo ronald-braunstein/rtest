@@ -1640,33 +1640,6 @@ impl ConstantScope {
         class.bases.iter().any(|base| is_enum_class_name(base))
             || class.bases.iter().any(|base| self.class_is_enum(base))
     }
-
-    /// Pending bindings of this scope and its classes. `class` is the top-level class this
-    /// scope belongs to, `None` for the module; nested class bodies resolve against globals.
-    fn collect_pending<'a>(
-        &'a self,
-        module_path: &'a [String],
-        class: Option<Option<&'a str>>,
-        pending: &mut Vec<PendingAssignment<'a>>,
-    ) {
-        for binding in self.bindings.values() {
-            if let BindingValue::Pending(pending_value) = &*binding.value.borrow() {
-                pending.push(PendingAssignment {
-                    module_path,
-                    enclosing_class: class.flatten(),
-                    value: &binding.value,
-                    pending: Rc::clone(pending_value),
-                });
-            }
-        }
-        for (name, child) in &self.children {
-            let child_class = match class {
-                None => Some(Some(name.as_str())),
-                Some(_) => Some(None),
-            };
-            child.collect_pending(module_path, child_class, pending);
-        }
-    }
 }
 
 fn record_assignment(scope: &mut ConstantScope, name: &str, value: &Expr, names: &ModuleNames) {
@@ -1824,26 +1797,18 @@ impl ConstantResolver {
             .modules
             .borrow_mut()
             .insert(resolver.current_path.clone(), Rc::new(loaded));
-        resolver.resolve_pending_assignments();
         resolver
     }
 
     /// Treat calls to these qualified functions like `typing.get_args`, flattening unions.
     pub fn with_literal_values_functions(mut self, functions: &[String]) -> Self {
-        if !functions.is_empty() {
-            self.literal_values_functions = functions.to_vec();
-            // Constants built from these calls could not resolve without the configuration.
-            self.resolve_pending_assignments();
-        }
+        self.literal_values_functions = functions.to_vec();
         self
     }
 
     /// Treat calls to these qualified functions as returning their first argument.
     pub fn with_passthrough_functions(mut self, functions: &[String]) -> Self {
-        if !functions.is_empty() {
-            self.passthrough_functions = functions.to_vec();
-            self.resolve_pending_assignments();
-        }
+        self.passthrough_functions = functions.to_vec();
         self
     }
 
@@ -1955,41 +1920,6 @@ impl ConstantResolver {
                 .cloned()
                 .collect(),
         )
-    }
-
-    fn resolve_pending_assignments(&self) {
-        for _ in 0..8 {
-            // Hold stable modules rather than copying every scope. Freeze the worklist
-            // before resolving: lookups may cache values and load additional modules.
-            let modules: Vec<_> = self
-                .modules
-                .borrow()
-                .iter()
-                .map(|(path, module)| (path.clone(), Rc::clone(module)))
-                .collect();
-            let mut pending = Vec::new();
-            for (path, module) in &modules {
-                module.scope.collect_pending(path, None, &mut pending);
-            }
-            let updates: Vec<_> = pending
-                .into_iter()
-                .filter_map(|assignment| {
-                    self.resolve_pending(
-                        assignment.module_path,
-                        assignment.enclosing_class,
-                        &assignment.pending,
-                        0,
-                    )
-                    .map(|value| (assignment, value))
-                })
-                .collect();
-            if updates.is_empty() {
-                break;
-            }
-            for (assignment, value) in updates {
-                *assignment.value.borrow_mut() = BindingValue::Known(value);
-            }
-        }
     }
 
     fn lookup_path_at(
@@ -3497,14 +3427,6 @@ impl ConstantResolver {
         }
         found
     }
-}
-
-struct PendingAssignment<'a> {
-    module_path: &'a [String],
-    /// The top-level class whose body holds the assignment; its names shadow globals.
-    enclosing_class: Option<&'a str>,
-    value: &'a RefCell<BindingValue>,
-    pending: Rc<PendingValue>,
 }
 
 fn collect_star_imports(module: &ModModule, context: &[String]) -> Vec<Vec<String>> {

@@ -7,7 +7,10 @@ use crate::collection::error::{CollectionError, CollectionResult};
 use ruff_python_ast::ModModule;
 use ruff_python_parser::parse_module;
 use ruff_python_stdlib::sys::is_builtin_module;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Information about a parsed Python module
 pub(crate) struct ParsedModule {
@@ -15,11 +18,21 @@ pub(crate) struct ParsedModule {
     pub(crate) module: ModModule,
 }
 
+/// Outcome of a load that is the same every time within one collection run.
+#[derive(Clone)]
+enum CachedLoad {
+    Loaded(Rc<ParsedModule>),
+    ImportError(String),
+    ParseError(String),
+}
+
 /// Resolves Python module imports to file paths and loads modules
 #[derive(Clone)]
 pub(crate) struct ModuleResolver {
     /// Search paths for module resolution
     search_paths: Vec<PathBuf>,
+    /// Shared by clones so each module is read and parsed once per collection run.
+    loads: Rc<RefCell<HashMap<Vec<String>, CachedLoad>>>,
 }
 
 impl ModuleResolver {
@@ -32,15 +45,41 @@ impl ModuleResolver {
         // Then add the project root
         search_paths.push(project_root.to_path_buf());
 
-        Self { search_paths }
+        Self {
+            search_paths,
+            loads: Rc::default(),
+        }
     }
 
-    /// Load an owned AST so callers can drop it after caching their extracted metadata.
-    /// Callers track loaded modules; retaining another cache here duplicates that state.
+    /// Parse a module, reusing the AST when another file in this run already loaded it.
     pub(crate) fn resolve_and_load(
         &self,
         module_path: &[String],
-    ) -> CollectionResult<ParsedModule> {
+    ) -> CollectionResult<Rc<ParsedModule>> {
+        let cached = self.loads.borrow().get(module_path).cloned();
+        let load = match cached {
+            Some(load) => load,
+            None => {
+                let load = match self.load_uncached(module_path) {
+                    Ok(parsed) => CachedLoad::Loaded(Rc::new(parsed)),
+                    Err(CollectionError::ImportError(message)) => CachedLoad::ImportError(message),
+                    Err(CollectionError::ParseError(message)) => CachedLoad::ParseError(message),
+                    Err(error) => return Err(error),
+                };
+                self.loads
+                    .borrow_mut()
+                    .insert(module_path.to_vec(), load.clone());
+                load
+            }
+        };
+        match load {
+            CachedLoad::Loaded(parsed) => Ok(parsed),
+            CachedLoad::ImportError(message) => Err(CollectionError::ImportError(message)),
+            CachedLoad::ParseError(message) => Err(CollectionError::ParseError(message)),
+        }
+    }
+
+    fn load_uncached(&self, module_path: &[String]) -> CollectionResult<ParsedModule> {
         let path = self.resolve(module_path)?;
         let source = std::fs::read_to_string(&path)?;
         let parsed = parse_module(&source).map_err(|e| {
