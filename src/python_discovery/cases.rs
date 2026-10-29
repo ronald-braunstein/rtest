@@ -14,7 +14,7 @@ use super::discovery::TestDiscoveryConfig;
 /// A literal value that can be statically extracted from AST.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralValue {
-    Int(i64),
+    Int(i128),
     Float(f64),
     String(String),
     Bool(bool),
@@ -960,15 +960,20 @@ pub(crate) fn eval_literal_binop(
         Operator::Add => l.checked_add(*r)?,
         Operator::Sub => l.checked_sub(*r)?,
         Operator::Mult => l.checked_mul(*r)?,
-        Operator::LShift if (0..64).contains(r) => l.checked_shl(*r as u32)?,
-        Operator::RShift if (0..64).contains(r) => l.checked_shr(*r as u32)?,
+        Operator::LShift if (0..128).contains(r) => shift_left(*l, *r as u32)?,
+        Operator::RShift if (0..128).contains(r) => l.checked_shr(*r as u32)?,
         Operator::BitOr => *l | *r,
         Operator::BitXor => *l ^ *r,
         Operator::BitAnd => *l & *r,
-        Operator::Pow if *r >= 0 && *r <= 63 => l.checked_pow(*r as u32)?,
+        Operator::Pow if (0..128).contains(r) => l.checked_pow(*r as u32)?,
         _ => return None,
     };
     Some(LiteralValue::Int(value))
+}
+
+/// `value << shift` that fails instead of dropping high bits, since Python ints don't overflow.
+fn shift_left(value: i128, shift: u32) -> Option<i128> {
+    value.checked_mul(2i128.checked_pow(shift)?)
 }
 
 fn as_f64(value: &LiteralValue) -> Option<f64> {
@@ -1547,7 +1552,41 @@ mod tests {
         assert_eq!(fold(Operator::Mod, Int(7), Int(2)), None);
         assert_eq!(fold(Operator::Pow, Float(2.0), Int(2)), None);
         assert_eq!(fold(Operator::Mult, Float(1e308), Float(10.0)), None);
-        assert_eq!(fold(Operator::Add, Int(i64::MAX), Float(1.0)), None);
+        assert_eq!(
+            fold(Operator::Add, Int(i128::from(i64::MAX)), Float(1.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_int_binops_fold_past_64_bits() {
+        use LiteralValue::Int;
+        let two_pow = |exp| eval_literal_binop(Operator::Pow, &Int(2), &Int(exp)).unwrap();
+        assert_eq!(
+            fold(Operator::Sub, two_pow(63), Int(1)).as_deref(),
+            Some("9223372036854775807")
+        );
+        assert_eq!(
+            fold(Operator::Sub, two_pow(64), Int(1)).as_deref(),
+            Some("18446744073709551615")
+        );
+        assert_eq!(
+            fold(Operator::LShift, Int(1), Int(100)).as_deref(),
+            Some("1267650600228229401496703205376")
+        );
+        assert_eq!(
+            fold(Operator::Mult, Int(-1), two_pow(126)).as_deref(),
+            Some("-85070591730234615865843651857942052864")
+        );
+    }
+
+    #[test]
+    fn test_int_binops_past_128_bits_do_not_fold() {
+        use LiteralValue::Int;
+        assert_eq!(fold(Operator::Pow, Int(2), Int(127)), None);
+        assert_eq!(fold(Operator::LShift, Int(1), Int(127)), None);
+        assert_eq!(fold(Operator::LShift, Int(3), Int(126)), None);
+        assert_eq!(fold(Operator::Mult, Int(i128::MAX), Int(2)), None);
     }
 
     #[test]

@@ -124,8 +124,8 @@ enum PendingValue {
     },
     Slice {
         source: Box<PendingValue>,
-        start: Option<i64>,
-        stop: Option<i64>,
+        start: Option<i128>,
+        stop: Option<i128>,
     },
     /// `seq[i]` or `mapping[key]`.
     Index {
@@ -184,7 +184,7 @@ enum PendingValue {
     /// `enumerate(x, start)`.
     Enumerate {
         source: Box<PendingValue>,
-        start: i64,
+        start: i128,
     },
     /// `zip(a, b, ...)`; with `strict=True` the sources must have equal lengths.
     Zip {
@@ -880,7 +880,7 @@ fn pending_call(
     };
     match (builtin, args.args.as_ref(), args.keywords.is_empty()) {
         ("range", bounds, true) if (1..=3).contains(&bounds.len()) => {
-            let bounds: Vec<i64> = bounds
+            let bounds: Vec<i128> = bounds
                 .iter()
                 .map(|b| match try_extract_literal(b)? {
                     LiteralValue::Int(i) => Some(i),
@@ -2103,7 +2103,7 @@ impl ConstantResolver {
                 INT_ENUM_MEMBERS
                     .iter()
                     .find(|(name, _)| *name == qualified)
-                    .map(|(_, value)| ResolvedValue::Literal(LiteralValue::Int(*value)))
+                    .map(|(_, value)| ResolvedValue::Literal(LiteralValue::Int(i128::from(*value))))
             }
             (found, _) => found,
         }
@@ -3199,7 +3199,7 @@ impl ConstantResolver {
                 };
                 let mut values = Vec::with_capacity(items.len());
                 for (offset, item) in items.into_iter().enumerate() {
-                    let index = start.checked_add(i64::try_from(offset).ok()?)?;
+                    let index = start.checked_add(i128::try_from(offset).ok()?)?;
                     values.push(LiteralValue::Sequence(vec![LiteralValue::Int(index), item]));
                 }
                 Some(LiteralValue::Sequence(values))
@@ -3387,8 +3387,8 @@ impl ConstantResolver {
                 let LiteralValue::Sequence(items) = resolve(source)? else {
                     return None;
                 };
-                let len = items.len() as i64;
-                let clamp = |bound: Option<i64>, default: i64| {
+                let len = items.len() as i128;
+                let clamp = |bound: Option<i128>, default: i128| {
                     let index = bound.map_or(default, |i| if i < 0 { len + i } else { i });
                     index.clamp(0, len) as usize
                 };
@@ -3612,6 +3612,23 @@ fn is_skipped_module(module_path: &[String]) -> bool {
     })
 }
 
+/// The value of an integer literal, or `None` past the 128-bit range rtest folds.
+fn int_literal_value(int: &ruff_python_ast::Int) -> Option<i128> {
+    if let Some(value) = int.as_u64() {
+        return Some(i128::from(value));
+    }
+    // Literals past u64 keep their source token, such as `0x1_0000_0000_0000_0000`.
+    let token = int.to_string().replace('_', "");
+    let lower = token.to_ascii_lowercase();
+    let (digits, radix) = match lower.get(..2) {
+        Some("0x") => (&lower[2..], 16),
+        Some("0o") => (&lower[2..], 8),
+        Some("0b") => (&lower[2..], 2),
+        _ => (lower.as_str(), 10),
+    };
+    i128::from_str_radix(digits, radix).ok()
+}
+
 /// Try to extract a literal value from an expression.
 ///
 /// This is intentionally limited to simple literals to avoid complexity.
@@ -3620,10 +3637,7 @@ pub(crate) fn try_extract_literal(expr: &Expr) -> Option<LiteralValue> {
         Expr::NumberLiteral(num) => {
             use ruff_python_ast::Number;
             match &num.value {
-                Number::Int(i) => Some(
-                    i.as_i64()
-                        .map_or_else(|| LiteralValue::String(i.to_string()), LiteralValue::Int),
-                ),
+                Number::Int(i) => int_literal_value(i).map(LiteralValue::Int),
                 Number::Float(f) => Some(LiteralValue::Float(*f)),
                 Number::Complex { .. } => None,
             }

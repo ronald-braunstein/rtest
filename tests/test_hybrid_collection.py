@@ -228,6 +228,11 @@ def test_hybrid_collection_matches_pytest() -> None:
                 def test_class_scope(self, value): pass
             @pytest.mark.parametrize("value", [0.5 * 1024 * 1024, 1 / 2, 1 / 3, 0.1 + 0.2, 2 * 1.5])
             def test_float_arithmetic(value): pass
+            @pytest.mark.parametrize(
+                "value",
+                [2**63 - 1, 2**64 - 1, -1 * 2**100, 1 << 70, 0x1_0000_0000_0000_0000, 18_446_744_073_709_551_616 * 2],
+            )
+            def test_int_arithmetic_past_64_bits(value): pass
         """,
         "test_duplicates.py": """
             import pytest
@@ -280,6 +285,8 @@ def test_hybrid_collection_matches_pytest() -> None:
                 ("fstring_runtime", "import os", '[f"{os.sep}x"]'),
                 ("fstring_call", "def name(n='n'): return n", '[f"{name()}"]'),
                 ("comparison", "ONE = 1", "[ONE == 1]"),
+                ("int_past_128_bits", "", "[2**127]"),
+                ("int_literal_past_128_bits", "", "[340_282_366_920_938_463_463_374_607_431_768_211_456]"),
                 (
                     "value_return",
                     "class _Base:\n    @classmethod\n    def code(cls) -> str: return 'c'\n"
